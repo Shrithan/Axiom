@@ -1,25 +1,23 @@
 // src-tauri/src/lib.rs
-// Axiom — Local-first Data Leakage Prevention
+// Axiom — Preview PDF Data Leakage Prevention
 //
-// Detection pipeline (v2):
-//   1. Capture screenshot with xcap
-//   2. Base64-encode the frame
-//   3. POST to local Ollama (http://localhost:11434) running a vision model
-//      (default: moondream, but llava / llava-phi3 / bakllava also work)
-//   4. Parse JSON response → Vec<Detection> with pixel-level bounding boxes
-//   5. Emit to overlay window → canvas draws highlight boxes
+// Pipeline (no screen recording required):
+//   1. AppleScript asks Preview for the path of its front document
+//   2. Python reads the PDF with pdfminer and extracts all text
+//   3. Regex patterns scan the text for PII
+//   4. Detections are emitted to the side panel
+//   5. Overlay window shows a badge over the Preview app window
 //
-// No OCR library, no regex, no cloud. 100% local.
+// No PaliGemma, no camera, no screen recording permission needed.
 
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::thread;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
-use xcap::Monitor;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -30,14 +28,8 @@ use xcap::Monitor;
 pub enum Severity { Low, Medium, High, Critical }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoundingBox {
-    pub x: f32, pub y: f32, pub width: f32, pub height: f32,
-    pub screen_width: u32, pub screen_height: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DetectionSource { Screen, Clipboard }
+pub enum DetectionSource { Pdf, Clipboard }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Detection {
@@ -46,7 +38,7 @@ pub struct Detection {
     pub matched_text: String,
     pub severity: Severity,
     pub source: DetectionSource,
-    pub bbox: Option<BoundingBox>,
+    pub page: Option<u32>,
     pub timestamp_ms: u64,
 }
 
@@ -54,38 +46,59 @@ pub struct Detection {
 pub struct ScanResult {
     pub detections: Vec<Detection>,
     pub raw_text_snippet: String,
+    pub pdf_path: Option<String>,
 }
 
-// The VLM is asked to return an array of these objects.
+/// One detection returned by the Python subprocess.
 #[derive(Debug, Deserialize)]
-struct VlmDetection {
-    label: String,          // e.g. "SSN", "CREDIT_CARD", "PASSWORD"
-    severity: String,       // "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
-    redacted: String,       // partially-masked value shown in UI
-    // Normalised 0-1 coordinates relative to the image
-    x: f32, y: f32,
-    w: f32, h: f32,
+struct PyDetection {
+    label:    String,
+    severity: String,
+    redacted: String,
+    #[serde(default)]
+    page: u32,
+}
+
+/// Response envelope from the Python subprocess.
+#[derive(Debug, Deserialize)]
+struct PyResponse {
+    id:         String,
+    detections: Vec<PyDetection>,
+    error:      Option<String>,
+    #[serde(default)]
+    ready:      bool,
+}
+
+// ---------------------------------------------------------------------------
+// AppState
+// ---------------------------------------------------------------------------
+
+pub struct PdfScanProcess {
+    pub child:  Child,
+    pub stdin:  ChildStdin,
+    pub stdout: BufReader<ChildStdout>,
 }
 
 pub struct AppState {
-    pub scanning: Arc<Mutex<bool>>,
+    pub scanning:       Arc<Mutex<bool>>,
     pub overlay_active: Arc<Mutex<bool>>,
-    /// Ollama model to use for vision inference.
-    /// Override via the "AXIOM_MODEL" environment variable (default: moondream).
-    pub model: String,
-    /// Ollama base URL (default: http://localhost:11434)
-    pub ollama_url: String,
+    pub py_process:     Arc<Mutex<Option<PdfScanProcess>>>,
+    pub model_ready:    Arc<Mutex<bool>>,
+    pub script_path:    String,
+    pub last_pdf_path:  Arc<Mutex<Option<String>>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let script = std::env::var("AXIOM_PY_SCRIPT")
+            .unwrap_or_else(|_| "scripts/pdf_scanner.py".to_string());
         AppState {
-            scanning: Arc::new(Mutex::new(false)),
+            scanning:      Arc::new(Mutex::new(false)),
             overlay_active: Arc::new(Mutex::new(false)),
-            model: std::env::var("AXIOM_MODEL")
-                .unwrap_or_else(|_| "moondream".to_string()),
-            ollama_url: std::env::var("AXIOM_OLLAMA_URL")
-                .unwrap_or_else(|_| "http://localhost:11434".to_string()),
+            py_process:    Arc::new(Mutex::new(None)),
+            model_ready:   Arc::new(Mutex::new(false)),
+            script_path:   script,
+            last_pdf_path: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -110,6 +123,30 @@ fn severity_from_str(s: &str) -> Severity {
     }
 }
 
+/// Ask Preview (via AppleScript) for the path of its front document.
+/// Returns None if Preview isn't open or has no document.
+fn get_preview_pdf_path() -> Option<String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(r#"tell application "Preview"
+    if (count of documents) > 0 then
+        set f to file of front document
+        POSIX path of f
+    else
+        ""
+    end if
+end tell"#)
+        .output()
+        .ok()?;
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() || !path.ends_with(".pdf") {
+        None
+    } else {
+        Some(path)
+    }
+}
+
 fn get_clipboard_text() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use arboard::Clipboard;
     Ok(Clipboard::new()?.get_text().unwrap_or_default())
@@ -121,14 +158,14 @@ fn scan_clipboard_for_pii(text: &str) -> Vec<Detection> {
 
     lazy_static! {
         static ref PATTERNS: Vec<(&'static str, &'static str, Regex)> = vec![
-            ("SSN",            "CRITICAL", Regex::new(r"\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b").unwrap()),
-            ("CREDIT_CARD",    "CRITICAL", Regex::new(r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b").unwrap()),
-            ("EMAIL",          "MEDIUM",   Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").unwrap()),
-            ("AWS_ACCESS_KEY", "CRITICAL", Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap()),
-            ("JWT_TOKEN",      "CRITICAL", Regex::new(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b").unwrap()),
-            ("PASSWORD",       "CRITICAL", Regex::new(r"(?i)(?:password|passwd|pwd|secret)\s*[:=]\s*\S+").unwrap()),
-            ("PRIVATE_KEY",    "CRITICAL", Regex::new(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----").unwrap()),
-            ("PHONE_US",       "MEDIUM",   Regex::new(r"\b(?:\+1[\s\-]?)?\(?[0-9]{3}\)?[\s\-]?[0-9]{3}[\s\-]?[0-9]{4}\b").unwrap()),
+            ("SSN",         "CRITICAL", Regex::new(r"\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b").unwrap()),
+            ("CREDIT_CARD", "CRITICAL", Regex::new(r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b").unwrap()),
+            ("EMAIL",       "MEDIUM",   Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").unwrap()),
+            ("AWS_KEY",     "CRITICAL", Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap()),
+            ("JWT",         "CRITICAL", Regex::new(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b").unwrap()),
+            ("PASSWORD",    "CRITICAL", Regex::new(r"(?i)(?:password|passwd|pwd|secret)\s*[:=]\s*\S+").unwrap()),
+            ("PRIVATE_KEY", "CRITICAL", Regex::new(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----").unwrap()),
+            ("PHONE",       "MEDIUM",   Regex::new(r"\b(?:\+1[\s\-]?)?\(?[0-9]{3}\)?[\s\-]?[0-9]{3}[\s\-]?[0-9]{4}\b").unwrap()),
         ];
     }
 
@@ -136,18 +173,15 @@ fn scan_clipboard_for_pii(text: &str) -> Vec<Detection> {
     PATTERNS.iter().flat_map(|(name, sev, re)| {
         re.find_iter(text).map(|m| {
             let raw = m.as_str();
-            let redacted = if raw.len() <= 4 {
-                "*".repeat(raw.len())
-            } else {
-                format!("{}****", &raw[..4])
-            };
+            let redacted = if raw.len() <= 4 { "*".repeat(raw.len()) }
+                           else { format!("{}****", &raw[..4]) };
             Detection {
                 id: format!("{}-{}-{}", name, m.start(), ts),
                 pattern_name: name.to_string(),
                 matched_text: redacted,
                 severity: severity_from_str(sev),
                 source: DetectionSource::Clipboard,
-                bbox: None,
+                page: None,
                 timestamp_ms: ts,
             }
         }).collect::<Vec<_>>()
@@ -155,132 +189,129 @@ fn scan_clipboard_for_pii(text: &str) -> Vec<Detection> {
 }
 
 // ---------------------------------------------------------------------------
-// VLM inference via Ollama
+// Python subprocess management
 // ---------------------------------------------------------------------------
 
-/// System prompt that instructs the VLM to return structured JSON.
-const SYSTEM_PROMPT: &str = r#"You are a data-loss prevention AI. Your ONLY job is to identify personally identifiable information (PII) and secrets that are VISIBLE on the screenshot provided.
-
-Return ONLY a JSON array (no markdown, no explanation). Each element must follow this exact schema:
-{
-  "label": "<type>",       // SSN | CREDIT_CARD | EMAIL | PHONE | AWS_KEY | PASSWORD | PRIVATE_KEY | JWT | API_KEY | CORP_SECRET | OTHER_PII
-  "severity": "<level>",   // CRITICAL | HIGH | MEDIUM | LOW
-  "redacted": "<masked>",  // First 4 chars + **** — never include the full value
-  "x": <float 0-1>,        // left edge of the sensitive text, normalised to image width
-  "y": <float 0-1>,        // top edge, normalised to image height
-  "w": <float 0-1>,        // width, normalised
-  "h": <float 0-1>         // height, normalised
+fn find_python() -> String {
+    // We'll check the paths based on your screenshot (venv at root)
+    let candidates = ["venv/bin/python3", "venv/bin/python", "python3", "python"];
+    
+    for c in &candidates {
+        match Command::new(c).arg("--version").output() {
+            Ok(output) => {
+                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                eprintln!("[Axiom-Debug] Found Python candidate '{}' -> {}", c, version);
+                return c.to_string();
+            }
+            Err(e) => {
+                eprintln!("[Axiom-Debug] Candidate '{}' failed: {}", c, e);
+            }
+        }
+    }
+    eprintln!("[Axiom-Debug] No venv found! Falling back to system 'python3'");
+    "python3".to_string()
 }
 
-If nothing sensitive is visible, return an empty array: []
-Do NOT include any text outside the JSON array."#;
+fn spawn_pdf_scanner(script_path: &str) -> anyhow::Result<PdfScanProcess> {
+    let python = find_python();
+    let current_dir = std::env::current_dir().unwrap_or_default();
+    
+    eprintln!("[Axiom-Debug] CWD: {:?}", current_dir);
+    eprintln!("[Axiom-Debug] Spawning: {} {}", python, script_path);
 
-/// Calls Ollama's /api/generate (or /api/chat) with the screenshot image.
-/// Returns raw model output string.
-fn call_ollama(
-    base_url: &str,
-    model: &str,
-    image_b64: &str,
-) -> anyhow::Result<String> {
-    // Use the blocking ureq client (no async needed inside the scan thread)
-    let url = format!("{}/api/generate", base_url.trim_end_matches('/'));
+    let mut child = Command::new(&python)
+        .arg(script_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit()) // This is vital: it sends Python Tracebacks to your terminal
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn process: {}. Is '{}' installed?", e, python))?;
 
-    let body = serde_json::json!({
-        "model": model,
-        "prompt": "Analyse this screenshot for sensitive data and return JSON.",
-        "system": SYSTEM_PROMPT,
-        "images": [image_b64],
-        "stream": false,
-        "options": {
-            "temperature": 0.0,
-            "num_predict": 1024,
+    let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
+    let stdout_raw = child.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+    let mut stdout = BufReader::new(stdout_raw);
+
+    // Wait for ready signal with detailed timeout error
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdout.read_line(&mut line) {
+            Ok(0) => {
+                // The process exited. Let's try to see why.
+                let status = child.try_wait()?;
+                anyhow::bail!(
+                    "Subprocess exited immediately. Exit Status: {:?}. \nCheck if 'scripts/pdf_scanner.py' exists and if 'pdfminer.six' is installed in your venv.", 
+                    status
+                );
+            }
+            Ok(_) => {
+                let t = line.trim();
+                if t.is_empty() { continue; }
+                eprintln!("[Axiom-Debug] Python Init Output: {}", t);
+                let resp: PyResponse = serde_json::from_str(t)
+                    .map_err(|e| anyhow::anyhow!("JSON Parse Error: {} - Raw line: {}", e, t))?;
+                if let Some(err) = resp.error {
+                    anyhow::bail!("Python Script Error: {}", err);
+                }
+                if resp.ready { break; }
+            }
+            Err(e) => anyhow::bail!("Read error: {}", e),
         }
-    });
+    }
 
-    let response = ureq::post(&url)
-        .timeout(Duration::from_secs(60))
-        .send_json(&body)?;
-
-    let json: serde_json::Value = response.into_json()?;
-    Ok(json["response"].as_str().unwrap_or("[]").to_string())
+    Ok(PdfScanProcess { child, stdin, stdout })
 }
 
-/// Parse VLM output string → Vec<Detection> with bounding boxes.
-fn parse_vlm_response(
-    raw: &str,
-    screen_width: u32,
-    screen_height: u32,
-) -> Vec<Detection> {
-    // Strip any markdown fences the model may have added
-    let cleaned = raw
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
+fn query_subprocess(proc: &mut PdfScanProcess, req_id: &str, pdf_path: &str) -> anyhow::Result<Vec<PyDetection>> {
+    let req = serde_json::json!({ "id": req_id, "pdf_path": pdf_path });
+    let mut line_out = serde_json::to_string(&req)?;
+    line_out.push('\n');
+    proc.stdin.write_all(line_out.as_bytes())?;
+    proc.stdin.flush()?;
 
-    // Find the JSON array
-    let start = cleaned.find('[').unwrap_or(0);
-    let end = cleaned.rfind(']').map(|i| i + 1).unwrap_or(cleaned.len());
-    let json_str = &cleaned[start..end];
+    let mut resp_line = String::new();
+    loop {
+        resp_line.clear();
+        let n = proc.stdout.read_line(&mut resp_line)?;
+        if n == 0 { anyhow::bail!("Subprocess closed stdout unexpectedly"); }
+        let t = resp_line.trim();
+        if t.is_empty() { continue; }
+        let resp: PyResponse = serde_json::from_str(t)
+            .map_err(|e| anyhow::anyhow!("Bad response JSON: {e} — raw: {t}"))?;
+        if let Some(err) = resp.error { anyhow::bail!("Subprocess error: {err}"); }
+        return Ok(resp.detections);
+    }
+}
 
-    let items: Vec<VlmDetection> = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[Axiom VLM] JSON parse error: {e}\nRaw output:\n{raw}");
-            return Vec::new();
-        }
-    };
-
+fn py_to_detections(items: Vec<PyDetection>) -> Vec<Detection> {
     let ts = timestamp_ms();
-    items.into_iter().enumerate().map(|(i, item)| {
-        // Convert normalised 0-1 coords → pixel coords
-        let px = item.x * screen_width as f32;
-        let py = item.y * screen_height as f32;
-        let pw = item.w * screen_width as f32;
-        let ph = item.h * screen_height as f32;
-
-        Detection {
-            id: format!("{}-{}-{}", item.label, i, ts),
-            pattern_name: item.label,
-            matched_text: item.redacted,
-            severity: severity_from_str(&item.severity),
-            source: DetectionSource::Screen,
-            bbox: Some(BoundingBox {
-                x: px, y: py, width: pw, height: ph,
-                screen_width, screen_height,
-            }),
-            timestamp_ms: ts,
-        }
+    items.into_iter().enumerate().map(|(i, item)| Detection {
+        id: format!("{}-{}-{}", item.label, i, ts),
+        pattern_name: item.label,
+        matched_text: item.redacted,
+        severity: severity_from_str(&item.severity),
+        source: DetectionSource::Pdf,
+        page: if item.page > 0 { Some(item.page) } else { None },
+        timestamp_ms: ts,
     }).collect()
 }
 
 // ---------------------------------------------------------------------------
-// Overlay window management
+// Overlay window
 // ---------------------------------------------------------------------------
 
 fn get_or_create_overlay(app: &AppHandle) -> anyhow::Result<tauri::WebviewWindow> {
-    if let Some(w) = app.get_webview_window("overlay") {
-        return Ok(w);
-    }
+    if let Some(w) = app.get_webview_window("overlay") { return Ok(w); }
 
-    let (screen_w, screen_h) = app
-        .primary_monitor()
-        .ok()
-        .flatten()
+    let (sw, sh) = app.primary_monitor().ok().flatten()
         .map(|m| { let s = m.size(); (s.width, s.height) })
         .unwrap_or((1920, 1080));
 
     let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("/overlay".into()))
         .title("Axiom Overlay")
-        .transparent(true)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .inner_size(screen_w as f64, screen_h as f64)
-        .position(0.0, 0.0)
-        .focused(false)
+        .transparent(true).decorations(false).always_on_top(true)
+        .skip_taskbar(true).resizable(false)
+        .inner_size(sw as f64, sh as f64).position(0.0, 0.0).focused(false)
         .build()?;
 
     overlay.set_ignore_cursor_events(true)?;
@@ -307,75 +338,101 @@ mod commands {
 
         get_or_create_overlay(&app).map_err(|e| e.to_string())?;
 
-        let flag       = Arc::clone(&state.scanning);
-        let handle     = app.clone();
-        let model      = state.model.clone();
-        let ollama_url = state.ollama_url.clone();
+        let flag         = Arc::clone(&state.scanning);
+        let py_proc_arc  = Arc::clone(&state.py_process);
+        let ready_arc    = Arc::clone(&state.model_ready);
+        let pdf_path_arc = Arc::clone(&state.last_pdf_path);
+        let handle       = app.clone();
+        let script_path  = state.script_path.clone();
 
         thread::spawn(move || {
-            eprintln!("[Axiom] Starting VLM scan loop — model={model} url={ollama_url}");
+            // Spawn Python subprocess
+            let proc = match spawn_pdf_scanner(&script_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    let msg = format!(
+                        "{e}\n\nSetup:\n\
+                         cd scripts && pip install pdfminer.six"
+                    );
+                    eprintln!("[Axiom] {msg}");
+                    let _ = handle.emit_to("main", "paligemma_error", &msg);
+                    if let Ok(mut s) = flag.lock() { *s = false; }
+                    return;
+                }
+            };
+
+            if let Ok(mut g) = py_proc_arc.lock() { *g = Some(proc); }
+            if let Ok(mut r) = ready_arc.lock()   { *r = true; }
+            let _ = handle.emit_to("main", "paligemma_ready", ());
+
+            let mut req_counter: u64 = 0;
+            let mut last_scanned_path: Option<String> = None;
 
             while *flag.lock().unwrap() {
-                let monitors = match Monitor::all() {
-                    Ok(m) => m,
-                    Err(e) => { eprintln!("[Axiom] monitors: {e}"); thread::sleep(Duration::from_secs(2)); continue; }
+                // Ask Preview which PDF it has open
+                let pdf_path = match get_preview_pdf_path() {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[Axiom] Preview not open or no PDF — waiting…");
+                        let _ = handle.emit_to("main", "preview_status",
+                            serde_json::json!({"status": "waiting", "message": "Open a PDF in Preview to begin scanning"}));
+                        thread::sleep(Duration::from_secs(3));
+                        continue;
+                    }
                 };
 
-                let mut all_det: Vec<Detection> = Vec::new();
-
-                for mon in &monitors {
-                    let sw = mon.width().unwrap_or(1920);
-                    let sh = mon.height().unwrap_or(1080);
-
-                    // 1. Capture
-                    let rgba = match mon.capture_image() {
-                        Ok(i) => i,
-                        Err(e) => { eprintln!("[Axiom] capture: {e}"); continue; }
-                    };
-
-                    // 2. Encode as PNG → base64
-                    let img = image::DynamicImage::ImageRgba8(rgba);
-                    let mut png_bytes: Vec<u8> = Vec::new();
-                    if let Err(e) = img.write_to(
-                        &mut std::io::Cursor::new(&mut png_bytes),
-                        image::ImageFormat::Png,
-                    ) {
-                        eprintln!("[Axiom] PNG encode: {e}"); continue;
-                    }
-                    let b64 = B64.encode(&png_bytes);
-
-                    // 3. Call VLM
-                    eprintln!("[Axiom] Sending {:.1}KB frame to VLM ({model})…", png_bytes.len() as f32 / 1024.0);
-                    let raw_response = match call_ollama(&ollama_url, &model, &b64) {
-                        Ok(r) => r,
-                        Err(e) => { eprintln!("[Axiom] VLM call failed: {e}"); continue; }
-                    };
-                    eprintln!("[Axiom] VLM raw response: {}", &raw_response.chars().take(400).collect::<String>());
-
-                    // 4. Parse → detections
-                    let mut hits = parse_vlm_response(&raw_response, sw, sh);
-                    eprintln!("[Axiom] Parsed {} detection(s) from VLM", hits.len());
-                    all_det.append(&mut hits);
+                // Only re-scan if the file changed
+                if Some(&pdf_path) == last_scanned_path.as_ref() {
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
                 }
 
-                // 5. Clipboard (regex fallback — fast, no image needed)
+                eprintln!("[Axiom] Scanning PDF: {pdf_path}");
+                let _ = handle.emit_to("main", "preview_status",
+                    serde_json::json!({"status": "scanning", "message": format!("Scanning: {}", pdf_path.split('/').last().unwrap_or(&pdf_path))}));
+
+                // Store path
+                if let Ok(mut p) = pdf_path_arc.lock() { *p = Some(pdf_path.clone()); }
+
+                req_counter += 1;
+                let req_id = req_counter.to_string();
+
+                let py_dets = {
+                    let mut guard = py_proc_arc.lock().unwrap();
+                    match guard.as_mut() {
+                        Some(proc) => match query_subprocess(proc, &req_id, &pdf_path) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                eprintln!("[Axiom] Scan failed: {e}");
+                                let _ = handle.emit_to("main", "paligemma_error", e.to_string());
+                                Vec::new()
+                            }
+                        },
+                        None => Vec::new(),
+                    }
+                };
+
+                last_scanned_path = Some(pdf_path.clone());
+                let mut all_det = py_to_detections(py_dets);
+
+                // Also scan clipboard
                 if let Ok(cb) = get_clipboard_text() {
                     all_det.append(&mut scan_clipboard_for_pii(&cb));
                 }
 
-                if !all_det.is_empty() {
-                    let snippet: String = all_det.iter()
-                        .map(|d| format!("[{}] {}", d.pattern_name, d.matched_text))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                let snippet = all_det.iter()
+                    .map(|d| format!("[{}] {}", d.pattern_name, d.matched_text))
+                    .collect::<Vec<_>>().join(", ");
 
-                    let payload = ScanResult { detections: all_det, raw_text_snippet: snippet };
-                    eprintln!("[Axiom] Emitting {} detection(s)", payload.detections.len());
-                    let _ = handle.emit_to("main", "scan_result", &payload);
-                    let _ = handle.emit_to("overlay", "scan_result", &payload);
-                }
+                let payload = ScanResult {
+                    detections: all_det,
+                    raw_text_snippet: snippet,
+                    pdf_path: Some(pdf_path),
+                };
 
-                // VLM inference is slower; poll every 3 seconds
+                let _ = handle.emit_to("main",    "scan_result", &payload);
+                let _ = handle.emit_to("overlay", "scan_result", &payload);
+
                 thread::sleep(Duration::from_secs(3));
             }
 
@@ -388,19 +445,24 @@ mod commands {
     #[tauri::command]
     pub async fn stop_scanning(state: State<'_, AppState>) -> Result<(), String> {
         *state.scanning.lock().map_err(|e| e.to_string())? = false;
+        if let Ok(mut guard) = state.py_process.lock() {
+            if let Some(mut proc) = guard.take() {
+                let _ = proc.child.kill();
+                let _ = proc.child.wait();
+                eprintln!("[Axiom] PDF scanner subprocess stopped");
+            }
+        }
+        *state.model_ready.lock().map_err(|e| e.to_string())? = false;
         Ok(())
     }
 
     #[tauri::command]
     pub async fn set_overlay_visible(
-        app: AppHandle,
-        state: State<'_, AppState>,
-        visible: bool,
+        app: AppHandle, state: State<'_, AppState>, visible: bool,
     ) -> Result<(), String> {
         *state.overlay_active.lock().map_err(|e| e.to_string())? = visible;
         if visible {
-            let overlay = get_or_create_overlay(&app).map_err(|e| e.to_string())?;
-            overlay.show().map_err(|e| e.to_string())?;
+            get_or_create_overlay(&app).map_err(|e| e.to_string())?.show().map_err(|e| e.to_string())?;
         } else if let Some(w) = app.get_webview_window("overlay") {
             w.hide().map_err(|e| e.to_string())?;
         }
@@ -418,12 +480,17 @@ mod commands {
         Ok(scan_clipboard_for_pii(&text))
     }
 
-    /// Returns the active Ollama model name and endpoint for display in the UI.
+    #[tauri::command]
+    pub async fn get_current_pdf(state: State<'_, AppState>) -> Result<Option<String>, String> {
+        Ok(state.last_pdf_path.lock().map_err(|e| e.to_string())?.clone())
+    }
+
     #[tauri::command]
     pub async fn get_model_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
         Ok(serde_json::json!({
-            "model": state.model,
-            "ollama_url": state.ollama_url,
+            "model":       "PDF Text Extractor (pdfminer)",
+            "script_path": state.script_path,
+            "ready":       *state.model_ready.lock().map_err(|e| e.to_string())?,
         }))
     }
 }
@@ -442,6 +509,7 @@ pub fn run() {
             commands::set_overlay_visible,
             commands::get_overlay_active,
             commands::scan_clipboard_now,
+            commands::get_current_pdf,
             commands::get_model_info,
         ])
         .run(tauri::generate_context!())
