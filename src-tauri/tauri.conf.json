@@ -13,15 +13,17 @@
     "windows": [
       {
         "label": "main",
-        "title": "Axiom \u2014 Data Leakage Prevention",
-        "width": 340,
-        "height": 700,
-        "resizable": false,
+        "title": "Axiom — Data Leakage Prevention",
+        "width": 1100, 
+        "height": 750,
+        "minWidth": 1100,
+        "minHeight": 750,
+        "resizable": true, 
         "fullscreen": false,
+        "maximized": false,
         "decorations": true,
-        "transparent": false,
-        "alwaysOnTop": false,
-        "skipTaskbar": false
+        "transparent": true,
+        "center": true
       }
     ],
     "security": {

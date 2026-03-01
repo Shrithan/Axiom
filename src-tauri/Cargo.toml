@@ -12,7 +12,8 @@ codegen-units = 1
 strip         = true
 
 [dependencies]
-tauri              = { version = "2", features = ["devtools", "macos-private-api"] }
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+tauri              = { version = "2", features = [ "macos-private-api", "devtools"] }
 tauri-plugin-shell = "2"
 
 # Clipboard regex fallback
@@ -31,6 +32,8 @@ env_logger = "0.11"
 thiserror  = "1"
 anyhow     = "1"
 dirs       = "5"
+tauri-plugin-notification = "2.0.0-rc"
+tauri-plugin-dialog = "2.0.0-rc"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -12,6 +12,8 @@
   "dependencies": {
     "@mediapipe/tasks-genai": "^0.10.26",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "~2.0.0-rc",
+    "@tauri-apps/plugin-notification": "~2.0.0-rc",
     "@tauri-apps/plugin-opener": "^2",
     "mediapipe": "0.0.1-security",
     "react": "^19.1.0",
