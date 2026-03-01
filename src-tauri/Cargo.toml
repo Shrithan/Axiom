@@ -1,0 +1,51 @@
+[package]
+name = "axiom"
+version = "0.2.0"
+description = "Axiom — Local-first data-leakage prevention desktop app (VLM edition)"
+authors     = ["Your Name <you@example.com>"]
+edition     = "2021"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true
+
+[dependencies]
+tauri              = { version = "2", features = ["devtools", "macos-private-api"] }
+tauri-plugin-shell = "2"
+
+# Screenshot capture
+xcap = "0.8"
+
+# Image encoding (PNG → base64 for VLM)
+image  = "0.25"
+base64 = "0.22"
+
+# HTTP client for Ollama (blocking — used inside scan thread)
+ureq = { version = "2", features = ["json"] }
+
+# Clipboard fallback regex scan
+regex      = "1"
+lazy_static = "1"
+
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+rusqlite   = { version = "0.31", features = ["bundled-sqlcipher"] }
+arboard    = "3"
+
+tokio      = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+zeroize    = { version = "1", features = ["derive"] }
+
+log        = "0.4"
+env_logger = "0.11"
+thiserror  = "1"
+anyhow     = "1"
+dirs       = "5"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
