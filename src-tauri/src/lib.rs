@@ -40,13 +40,23 @@ pub struct Detection {
     pub source: DetectionSource,
     pub page: Option<u32>,
     pub timestamp_ms: u64,
+    /// Which detection layer(s) caught this: "regex", "gemma", or "regex+gemma"
+    pub detection_layer: String,
+    /// Gemma confidence: "high" | "medium" | "low"
+    pub confidence: String,
+    /// Raw matched value — used by the redactor, not shown in UI
+    pub raw_value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
-    pub detections: Vec<Detection>,
+    pub detections:   Vec<Detection>,
     pub raw_text_snippet: String,
-    pub pdf_path: Option<String>,
+    pub pdf_path:     Option<String>,
+    pub gemma_log:    Vec<GemmaPageLog>,
+    /// Model info from init handshake
+    pub model_id:     Option<String>,
+    pub device:       Option<String>,
 }
 
 /// One detection returned by the Python subprocess.
@@ -56,7 +66,24 @@ struct PyDetection {
     severity: String,
     redacted: String,
     #[serde(default)]
+    raw_value: String,
+    #[serde(default)]
     page: u32,
+    #[serde(default)]
+    detection_layer: String,
+    #[serde(default)]
+    confidence: String,
+}
+
+/// Per-page Gemma activity log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GemmaPageLog {
+    pub page:         u32,
+    pub chunks:       u32,
+    pub raw_findings: u32,
+    pub kept:         u32,
+    pub duration_ms:  u32,
+    pub status:       String,  // "ok" | "empty" | "parse_error" | "blank"
 }
 
 /// Response envelope from the Python subprocess.
@@ -67,6 +94,10 @@ struct PyResponse {
     error:      Option<String>,
     #[serde(default)]
     ready:      bool,
+    #[serde(default)]
+    gemma_log:  Vec<GemmaPageLog>,
+    model:      Option<String>,
+    device:     Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,12 +111,16 @@ pub struct PdfScanProcess {
 }
 
 pub struct AppState {
-    pub scanning:       Arc<Mutex<bool>>,
-    pub overlay_active: Arc<Mutex<bool>>,
-    pub py_process:     Arc<Mutex<Option<PdfScanProcess>>>,
-    pub model_ready:    Arc<Mutex<bool>>,
-    pub script_path:    String,
-    pub last_pdf_path:  Arc<Mutex<Option<String>>>,
+    pub scanning:        Arc<Mutex<bool>>,
+    pub overlay_active:  Arc<Mutex<bool>>,
+    pub py_process:      Arc<Mutex<Option<PdfScanProcess>>>,
+    pub redact_process:  Arc<Mutex<Option<PdfScanProcess>>>,
+    pub model_ready:     Arc<Mutex<bool>>,
+    pub script_path:     String,
+    pub last_pdf_path:   Arc<Mutex<Option<String>>>,
+    pub last_detections: Arc<Mutex<Vec<serde_json::Value>>>,
+    pub model_id:        Arc<Mutex<Option<String>>>,
+    pub device:          Arc<Mutex<Option<String>>>,
 }
 
 impl Default for AppState {
@@ -93,12 +128,16 @@ impl Default for AppState {
         let script = std::env::var("AXIOM_PY_SCRIPT")
             .unwrap_or_else(|_| "scripts/pdf_scanner.py".to_string());
         AppState {
-            scanning:      Arc::new(Mutex::new(false)),
-            overlay_active: Arc::new(Mutex::new(false)),
-            py_process:    Arc::new(Mutex::new(None)),
-            model_ready:   Arc::new(Mutex::new(false)),
-            script_path:   script,
-            last_pdf_path: Arc::new(Mutex::new(None)),
+            scanning:        Arc::new(Mutex::new(false)),
+            overlay_active:  Arc::new(Mutex::new(false)),
+            py_process:      Arc::new(Mutex::new(None)),
+            redact_process:  Arc::new(Mutex::new(None)),
+            model_ready:     Arc::new(Mutex::new(false)),
+            script_path:     script,
+            last_pdf_path:   Arc::new(Mutex::new(None)),
+            last_detections: Arc::new(Mutex::new(Vec::new())),
+            model_id:        Arc::new(Mutex::new(None)),
+            device:          Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -123,27 +162,99 @@ fn severity_from_str(s: &str) -> Severity {
     }
 }
 
-/// Ask Preview (via AppleScript) for the path of its front document.
-/// Returns None if Preview isn't open or has no document.
+/// Ask open apps for the frontmost document path via AppleScript.
+/// Returns a POSIX path string, or None if nothing supported is open.
 fn get_preview_pdf_path() -> Option<String> {
+    const EXTS: &[&str] = &[".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"];
+
+    // Each entry: (app name, how to get the POSIX path of the front document)
+    // Preview uses `file of front document` → coerce to alias → POSIX path
+    // Office apps use `full name of front document` which is already a POSIX path
+    let script = r#"
+        set posixPath to ""
+
+        try
+            if application "Preview" is running then
+                set posixPath to run script "tell application \"Preview\" to get path of front document"
+                if posixPath is not "" then return posixPath
+            end if
+        end try
+
+        try
+            if application "Microsoft Word" is running then
+                set posixPath to run script "tell application \"Microsoft Word\" to get full name of active document"
+                if posixPath is not "" then return posixPath
+            end if
+        end try
+
+        try
+            if application "Microsoft Excel" is running then
+                set posixPath to run script "tell application \"Microsoft Excel\" to get full name of active workbook"
+                if posixPath is not "" then return posixPath
+            end if
+        end try
+
+        try
+            if application "Microsoft PowerPoint" is running then
+                set posixPath to run script "tell application \"Microsoft PowerPoint\" to get full name of active presentation"
+                if posixPath is not "" then return posixPath
+            end if
+        end try
+
+        try
+            if application "Pages" is running then
+                set posixPath to run script "tell application \"Pages\" to get POSIX path of (file of front document as alias)"
+                if posixPath is not "" then return posixPath
+            end if
+        end try
+
+        try
+            if application "Numbers" is running then
+                set posixPath to run script "tell application \"Numbers\" to get POSIX path of (file of front document as alias)"
+                if posixPath is not "" then return posixPath
+            end if
+        end try
+
+        try
+            if application "Keynote" is running then
+                set posixPath to run script "tell application \"Keynote\" to get POSIX path of (file of front document as alias)"
+                if posixPath is not "" then return posixPath
+            end if
+        end try
+
+        return posixPath
+    "#;
+
+    // Write to a temp file — passing multi-line scripts via -e causes parse errors
+    let script_path = std::env::temp_dir().join("axiom_detect.scpt");
+    if std::fs::write(&script_path, script).is_err() {
+        return None;
+    }
+
     let output = Command::new("osascript")
-        .arg("-e")
-        .arg(r#"tell application "Preview"
-    if (count of documents) > 0 then
-        set f to file of front document
-        POSIX path of f
-    else
-        ""
-    end if
-end tell"#)
+        .arg(&script_path)
         .output()
         .ok()?;
 
+    // Log stderr to help debug AppleScript errors
+    let err_out = String::from_utf8_lossy(&output.stderr);
+    if !err_out.trim().is_empty() {
+        eprintln!("[Axiom] AppleScript stderr: {}", err_out.trim());
+    }
+
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() || !path.ends_with(".pdf") {
-        None
-    } else {
+    eprintln!("[Axiom] AppleScript raw output: {:?}", path);
+
+    if path.is_empty() {
+        return None;
+    }
+
+    let path_lower = path.to_lowercase();
+    if EXTS.iter().any(|ext| path_lower.ends_with(ext)) {
         Some(path)
+    } else {
+        eprintln!("[Axiom] Unsupported extension, ignoring: {:?}", path);
+        None
     }
 }
 
@@ -183,6 +294,9 @@ fn scan_clipboard_for_pii(text: &str) -> Vec<Detection> {
                 source: DetectionSource::Clipboard,
                 page: None,
                 timestamp_ms: ts,
+                detection_layer: "regex".to_string(),
+                confidence: "high".to_string(),
+                raw_value: raw.to_string(),
             }
         }).collect::<Vec<_>>()
     }).collect()
@@ -193,76 +307,106 @@ fn scan_clipboard_for_pii(text: &str) -> Vec<Detection> {
 // ---------------------------------------------------------------------------
 
 fn find_python() -> String {
-    // We'll check the paths based on your screenshot (venv at root)
-    let candidates = ["venv/bin/python3", "venv/bin/python", "python3", "python"];
-    
-    for c in &candidates {
-        match Command::new(c).arg("--version").output() {
-            Ok(output) => {
-                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                eprintln!("[Axiom-Debug] Found Python candidate '{}' -> {}", c, version);
-                return c.to_string();
-            }
-            Err(e) => {
-                eprintln!("[Axiom-Debug] Candidate '{}' failed: {}", c, e);
-            }
-        }
-    }
-    eprintln!("[Axiom-Debug] No venv found! Falling back to system 'python3'");
+    // We are no longer looking for venv folders. 
+    // This relies on your global system path.
     "python3".to_string()
 }
 
-fn spawn_pdf_scanner(script_path: &str) -> anyhow::Result<PdfScanProcess> {
+fn spawn_pdf_scanner(script_path: &str) -> anyhow::Result<(PdfScanProcess, Option<String>, Option<String>)> {
     let python = find_python();
-    let current_dir = std::env::current_dir().unwrap_or_default();
     
-    eprintln!("[Axiom-Debug] CWD: {:?}", current_dir);
-    eprintln!("[Axiom-Debug] Spawning: {} {}", python, script_path);
+    // Resolve the absolute path to the script to avoid CWD issues
+    let mut base_path = std::env::current_dir().unwrap_or_default();
+    
+    // If the app started inside src-tauri, go up one level to find /scripts
+    if base_path.ends_with("src-tauri") {
+        base_path.pop();
+    }
+    
+    let absolute_script_path = base_path.join("scripts/pdf_scanner.py");
+    
+    eprintln!("[Axiom] Spawning: {} {:?}", python, absolute_script_path);
 
     let mut child = Command::new(&python)
-        .arg(script_path)
+        .arg(absolute_script_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // This is vital: it sends Python Tracebacks to your terminal
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn process: {}. Is '{}' installed?", e, python))?;
+        .stderr(Stdio::inherit()) // Keeps Python errors visible in your terminal
+        .spawn()?;
 
-    let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
-    let stdout_raw = child.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+    let stdin = child.stdin.take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open subprocess stdin"))?;
+    let stdout_raw = child.stdout.take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open subprocess stdout"))?;
     let mut stdout = BufReader::new(stdout_raw);
 
-    // Wait for ready signal with detailed timeout error
+    // Wait for ready signal
     let mut line = String::new();
     loop {
         line.clear();
-        match stdout.read_line(&mut line) {
-            Ok(0) => {
-                // The process exited. Let's try to see why.
-                let status = child.try_wait()?;
-                anyhow::bail!(
-                    "Subprocess exited immediately. Exit Status: {:?}. \nCheck if 'scripts/pdf_scanner.py' exists and if 'pdfminer.six' is installed in your venv.", 
-                    status
-                );
-            }
-            Ok(_) => {
-                let t = line.trim();
-                if t.is_empty() { continue; }
-                eprintln!("[Axiom-Debug] Python Init Output: {}", t);
-                let resp: PyResponse = serde_json::from_str(t)
-                    .map_err(|e| anyhow::anyhow!("JSON Parse Error: {} - Raw line: {}", e, t))?;
-                if let Some(err) = resp.error {
-                    anyhow::bail!("Python Script Error: {}", err);
-                }
-                if resp.ready { break; }
-            }
-            Err(e) => anyhow::bail!("Read error: {}", e),
+        let n = stdout.read_line(&mut line)?;
+        if n == 0 { 
+            let status = child.try_wait()?;
+            anyhow::bail!("Subprocess exited immediately with status: {:?}", status); 
         }
+        let t = line.trim();
+        if t.is_empty() { continue; }
+        let resp: PyResponse = serde_json::from_str(t)
+            .map_err(|e| anyhow::anyhow!("Bad init JSON: {e} — raw: {t}"))?;
+        if let Some(err) = resp.error {
+            anyhow::bail!("Subprocess init error: {err}");
+        }
+        if resp.ready {
+            let model = resp.model.clone();
+            let device = resp.device.clone();
+            return Ok((PdfScanProcess { child, stdin, stdout }, model, device));
+        }
+    }
+    anyhow::bail!("Subprocess never sent ready signal")
+}
+
+fn spawn_redactor() -> anyhow::Result<PdfScanProcess> {
+    let python = find_python();
+    let mut base_path = std::env::current_dir().unwrap_or_default();
+    if base_path.ends_with("src-tauri") { base_path.pop(); }
+    let script = base_path.join("scripts/redact_document.py");
+
+    eprintln!("[Axiom] Spawning redactor: {} {:?}", python, script);
+
+    let mut child = Command::new(&python)
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    let stdin      = child.stdin.take().ok_or_else(|| anyhow::anyhow!("redactor stdin"))?;
+    let stdout_raw = child.stdout.take().ok_or_else(|| anyhow::anyhow!("redactor stdout"))?;
+    let mut stdout = BufReader::new(stdout_raw);
+
+    // Wait for ready signal
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = stdout.read_line(&mut line)?;
+        if n == 0 {
+            let status = child.try_wait()?;
+            anyhow::bail!("Redactor exited immediately: {:?}", status);
+        }
+        let t = line.trim();
+        if t.is_empty() { continue; }
+        let resp: serde_json::Value = serde_json::from_str(t)
+            .map_err(|e| anyhow::anyhow!("Bad redactor init JSON: {e} raw: {t}"))?;
+        if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
+            if !err.is_empty() { anyhow::bail!("Redactor init error: {err}"); }
+        }
+        if resp.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) { break; }
     }
 
     Ok(PdfScanProcess { child, stdin, stdout })
 }
 
-fn query_subprocess(proc: &mut PdfScanProcess, req_id: &str, pdf_path: &str) -> anyhow::Result<Vec<PyDetection>> {
+fn query_subprocess(proc: &mut PdfScanProcess, req_id: &str, pdf_path: &str) -> anyhow::Result<PyResponse> {
     let req = serde_json::json!({ "id": req_id, "pdf_path": pdf_path });
     let mut line_out = serde_json::to_string(&req)?;
     line_out.push('\n');
@@ -279,7 +423,7 @@ fn query_subprocess(proc: &mut PdfScanProcess, req_id: &str, pdf_path: &str) -> 
         let resp: PyResponse = serde_json::from_str(t)
             .map_err(|e| anyhow::anyhow!("Bad response JSON: {e} — raw: {t}"))?;
         if let Some(err) = resp.error { anyhow::bail!("Subprocess error: {err}"); }
-        return Ok(resp.detections);
+        return Ok(resp);
     }
 }
 
@@ -293,6 +437,17 @@ fn py_to_detections(items: Vec<PyDetection>) -> Vec<Detection> {
         source: DetectionSource::Pdf,
         page: if item.page > 0 { Some(item.page) } else { None },
         timestamp_ms: ts,
+        detection_layer: if item.detection_layer.is_empty() {
+            "gemma".to_string()
+        } else {
+            item.detection_layer.clone()
+        },
+        confidence: if item.confidence.is_empty() {
+            "medium".to_string()
+        } else {
+            item.confidence.clone()
+        },
+        raw_value: item.raw_value.clone(),
     }).collect()
 }
 
@@ -341,28 +496,37 @@ mod commands {
         let flag         = Arc::clone(&state.scanning);
         let py_proc_arc  = Arc::clone(&state.py_process);
         let ready_arc    = Arc::clone(&state.model_ready);
-        let pdf_path_arc = Arc::clone(&state.last_pdf_path);
+        let pdf_path_arc  = Arc::clone(&state.last_pdf_path);
+        let detections_arc = Arc::clone(&state.last_detections);
+        let model_id_arc  = Arc::clone(&state.model_id);
+        let device_arc    = Arc::clone(&state.device);
         let handle       = app.clone();
         let script_path  = state.script_path.clone();
 
+        // Inside start_scanning in lib.rs
         thread::spawn(move || {
-            // Spawn Python subprocess
-            let proc = match spawn_pdf_scanner(&script_path) {
-                Ok(p) => p,
-                Err(e) => {
-                    let msg = format!(
-                        "{e}\n\nSetup:\n\
-                         cd scripts && pip install pdfminer.six"
-                    );
-                    eprintln!("[Axiom] {msg}");
-                    let _ = handle.emit_to("main", "paligemma_error", &msg);
-                    if let Ok(mut s) = flag.lock() { *s = false; }
-                    return;
-                }
-            };
+        // We pass a dummy string because spawn_pdf_scanner 
+        // now calculates the absolute path internally
+        let (proc, gemma_model_id, gemma_device) = match spawn_pdf_scanner("scripts/pdf_scanner.py") {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = format!("Scanner failed to start: {e}");
+                eprintln!("[Axiom] {msg}");
+                let _ = handle.emit_to("main", "paligemma_error", &msg);
+                if let Ok(mut s) = flag.lock() { *s = false; }
+                return;
+            }
+        };
 
             if let Ok(mut g) = py_proc_arc.lock() { *g = Some(proc); }
             if let Ok(mut r) = ready_arc.lock()   { *r = true; }
+            if let Ok(mut m) = model_id_arc.lock() { *m = gemma_model_id.clone(); }
+            if let Ok(mut d) = device_arc.lock()   { *d = gemma_device.clone(); }
+
+            // The init response is already consumed in spawn_pdf_scanner.
+            // We re-read model/device from a separate init_info if available.
+            // (spawn_pdf_scanner returns PdfScanProcess after ready signal;
+            //  model metadata is emitted via paligemma_ready payload below)
             let _ = handle.emit_to("main", "paligemma_ready", ());
 
             let mut req_counter: u64 = 0;
@@ -373,9 +537,9 @@ mod commands {
                 let pdf_path = match get_preview_pdf_path() {
                     Some(p) => p,
                     None => {
-                        eprintln!("[Axiom] Preview not open or no PDF — waiting…");
+                        eprintln!("[Axiom] No supported document open — waiting…");
                         let _ = handle.emit_to("main", "preview_status",
-                            serde_json::json!({"status": "waiting", "message": "Open a PDF in Preview to begin scanning"}));
+                            serde_json::json!({"status": "waiting", "message": "Open a PDF, DOCX, XLSX, or PPTX to begin scanning"}));
                         thread::sleep(Duration::from_secs(3));
                         continue;
                     }
@@ -397,23 +561,33 @@ mod commands {
                 req_counter += 1;
                 let req_id = req_counter.to_string();
 
-                let py_dets = {
+                let (py_dets, gemma_log) = {
                     let mut guard = py_proc_arc.lock().unwrap();
                     match guard.as_mut() {
                         Some(proc) => match query_subprocess(proc, &req_id, &pdf_path) {
-                            Ok(d) => d,
+                            Ok(r) => (r.detections, r.gemma_log),
                             Err(e) => {
                                 eprintln!("[Axiom] Scan failed: {e}");
                                 let _ = handle.emit_to("main", "paligemma_error", e.to_string());
-                                Vec::new()
+                                (Vec::new(), Vec::new())
                             }
                         },
-                        None => Vec::new(),
+                        None => (Vec::new(), Vec::new()),
                     }
                 };
 
                 last_scanned_path = Some(pdf_path.clone());
                 let mut all_det = py_to_detections(py_dets);
+
+                // Persist raw detections for the redactor
+                if let Ok(mut d) = detections_arc.lock() {
+                    *d = all_det.iter().map(|det| serde_json::json!({
+                        "label":     det.pattern_name,
+                        "severity":  format!("{:?}", det.severity),
+                        "raw_value": det.raw_value,
+                        "page":      det.page.unwrap_or(1),
+                    })).collect();
+                }
 
                 // Also scan clipboard
                 if let Ok(cb) = get_clipboard_text() {
@@ -424,10 +598,16 @@ mod commands {
                     .map(|d| format!("[{}] {}", d.pattern_name, d.matched_text))
                     .collect::<Vec<_>>().join(", ");
 
+                let model_id_val = model_id_arc.lock().ok().and_then(|g| g.clone());
+                let device_val   = device_arc.lock().ok().and_then(|g| g.clone());
+
                 let payload = ScanResult {
                     detections: all_det,
                     raw_text_snippet: snippet,
                     pdf_path: Some(pdf_path),
+                    gemma_log,
+                    model_id: model_id_val,
+                    device:   device_val,
                 };
 
                 let _ = handle.emit_to("main",    "scan_result", &payload);
@@ -487,11 +667,80 @@ mod commands {
 
     #[tauri::command]
     pub async fn get_model_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+        let ready    = *state.model_ready.lock().map_err(|e| e.to_string())?;
+        let model_id = state.model_id.lock().map_err(|e| e.to_string())?.clone();
+        let device   = state.device.lock().map_err(|e| e.to_string())?.clone();
         Ok(serde_json::json!({
-            "model":       "PDF Text Extractor (pdfminer)",
+            "model":       model_id.unwrap_or_else(|| "google/gemma-3-1b-it".to_string()),
+            "device":      device.unwrap_or_else(|| "unknown".to_string()),
             "script_path": state.script_path,
-            "ready":       *state.model_ready.lock().map_err(|e| e.to_string())?,
+            "ready":       ready,
         }))
+    }
+
+    /// Produce a redacted copy of the current document and open it in Preview.
+    /// The original file is NEVER modified.
+    #[tauri::command]
+    pub async fn redact_document(state: State<'_, AppState>) -> Result<String, String> {
+        // Get current path and detections
+        let source_path = state.last_pdf_path.lock()
+            .map_err(|e| e.to_string())?
+            .clone()
+            .ok_or("No document currently open")?;
+
+        let detections = state.last_detections.lock()
+            .map_err(|e| e.to_string())?
+            .clone();
+
+        if detections.is_empty() {
+            return Err("No detections to redact — scan a document first".into());
+        }
+
+        // Spawn or reuse the redactor subprocess
+        let mut guard = state.redact_process.lock().map_err(|e| e.to_string())?;
+        if guard.is_none() {
+            let proc = spawn_redactor().map_err(|e| e.to_string())?;
+            *guard = Some(proc);
+        }
+
+        let proc = guard.as_mut().unwrap();
+
+        // Send request
+        let req = serde_json::json!({
+            "id":          "redact-1",
+            "source_path": source_path,
+            "detections":  detections,
+        });
+        let mut req_str = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+        req_str.push('\n');
+        proc.stdin.write_all(req_str.as_bytes()).map_err(|e| e.to_string())?;
+        proc.stdin.flush().map_err(|e| e.to_string())?;
+
+        // Read response
+        let mut resp_line = String::new();
+        loop {
+            resp_line.clear();
+            let n = proc.stdout.read_line(&mut resp_line).map_err(|e| e.to_string())?;
+            if n == 0 { return Err("Redactor subprocess closed unexpectedly".into()); }
+            let t = resp_line.trim();
+            if t.is_empty() { continue; }
+            let resp: serde_json::Value = serde_json::from_str(t).map_err(|e| e.to_string())?;
+            if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
+                if !err.is_empty() { return Err(err.to_string()); }
+            }
+            let redacted_path = resp.get("redacted_path")
+                .and_then(|p| p.as_str())
+                .ok_or("No redacted_path in response")?
+                .to_string();
+
+            // Open in Preview via osascript
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(format!(r#"tell application "Preview" to open POSIX file "{redacted_path}""#))
+                .spawn();
+
+            return Ok(redacted_path);
+        }
     }
 }
 
@@ -511,6 +760,7 @@ pub fn run() {
             commands::scan_clipboard_now,
             commands::get_current_pdf,
             commands::get_model_info,
+            commands::redact_document,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Axiom");
