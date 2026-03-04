@@ -1,5 +1,6 @@
-// src-tauri/src/lib.rs
-// Axiom — Preview PDF Data Leakage Prevention
+// src-tauri/src/lib.rs  (Employee app)
+// Axiom — PII Detection & Redaction
+// SQLite removed; all persistence goes through firebase_uploader.py subprocess.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -38,12 +39,12 @@ pub struct Detection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
-    pub detections:   Vec<Detection>,
+    pub detections:       Vec<Detection>,
     pub raw_text_snippet: String,
-    pub pdf_path:     Option<String>,
-    pub gemma_log:    Vec<GemmaPageLog>,
-    pub model_id:     Option<String>,
-    pub device:       Option<String>,
+    pub pdf_path:         Option<String>,
+    pub gemma_log:        Vec<GemmaPageLog>,
+    pub model_id:         Option<String>,
+    pub device:           Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,14 +52,10 @@ struct PyDetection {
     label:    String,
     severity: String,
     redacted: String,
-    #[serde(default)]
-    raw_value: String,
-    #[serde(default)]
-    page: u32,
-    #[serde(default)]
-    detection_layer: String,
-    #[serde(default)]
-    confidence: String,
+    #[serde(default)] raw_value:       String,
+    #[serde(default)] page:            u32,
+    #[serde(default)] detection_layer: String,
+    #[serde(default)] confidence:      String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,12 +71,10 @@ pub struct GemmaPageLog {
 #[derive(Debug, Deserialize)]
 struct PyResponse {
     id:         String,
-    detections: Vec<PyDetection>,
+    #[serde(default)] detections: Vec<PyDetection>,
     error:      Option<String>,
-    #[serde(default)]
-    ready:      bool,
-    #[serde(default)]
-    gemma_log:  Vec<GemmaPageLog>,
+    #[serde(default)] ready:      bool,
+    #[serde(default)] gemma_log:  Vec<GemmaPageLog>,
     model:      Option<String>,
     device:     Option<String>,
 }
@@ -95,32 +90,36 @@ pub struct PdfScanProcess {
 }
 
 pub struct AppState {
-    pub scanning:        Arc<Mutex<bool>>,
-    pub py_process:      Arc<Mutex<Option<PdfScanProcess>>>,
-    pub redact_process:  Arc<Mutex<Option<PdfScanProcess>>>,
-    pub model_ready:     Arc<Mutex<bool>>,
-    pub script_path:     String,
-    pub last_pdf_path:   Arc<Mutex<Option<String>>>,
-    pub last_detections: Arc<Mutex<Vec<serde_json::Value>>>,
-    pub model_id:        Arc<Mutex<Option<String>>>,
-    pub device:          Arc<Mutex<Option<String>>>,
-    pub scanned_paths:   Arc<Mutex<std::collections::HashSet<String>>>,
+    pub scanning:         Arc<Mutex<bool>>,
+    pub py_process:       Arc<Mutex<Option<PdfScanProcess>>>,
+    pub redact_process:   Arc<Mutex<Option<PdfScanProcess>>>,
+    // Firebase uploader subprocess
+    pub firebase_process: Arc<Mutex<Option<PdfScanProcess>>>,
+    pub model_ready:      Arc<Mutex<bool>>,
+    pub script_path:      String,
+    pub last_pdf_path:    Arc<Mutex<Option<String>>>,
+    pub last_detections:  Arc<Mutex<Vec<serde_json::Value>>>,
+    pub model_id:         Arc<Mutex<Option<String>>>,
+    pub device:           Arc<Mutex<Option<String>>>,
+    pub scanned_paths:    Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        let script = std::env::var("AXIOM_PY_SCRIPT").unwrap_or_else(|_| "scripts/pdf_scanner.py".to_string());
+        let script = std::env::var("AXIOM_PY_SCRIPT")
+            .unwrap_or_else(|_| "scripts/pdf_scanner.py".to_string());
         AppState {
-            scanning:        Arc::new(Mutex::new(false)),
-            py_process:      Arc::new(Mutex::new(None)),
-            redact_process:  Arc::new(Mutex::new(None)),
-            model_ready:     Arc::new(Mutex::new(false)),
-            script_path:     script,
-            last_pdf_path:   Arc::new(Mutex::new(None)),
-            last_detections: Arc::new(Mutex::new(Vec::new())),
-            model_id:        Arc::new(Mutex::new(None)),
-            device:          Arc::new(Mutex::new(None)),
-            scanned_paths:   Arc::new(Mutex::new(std::collections::HashSet::new())),
+            scanning:         Arc::new(Mutex::new(false)),
+            py_process:       Arc::new(Mutex::new(None)),
+            redact_process:   Arc::new(Mutex::new(None)),
+            firebase_process: Arc::new(Mutex::new(None)),
+            model_ready:      Arc::new(Mutex::new(false)),
+            script_path:      script,
+            last_pdf_path:    Arc::new(Mutex::new(None)),
+            last_detections:  Arc::new(Mutex::new(Vec::new())),
+            model_id:         Arc::new(Mutex::new(None)),
+            device:           Arc::new(Mutex::new(None)),
+            scanned_paths:    Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -129,41 +128,11 @@ impl Default for AppState {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn init_shared_db() -> rusqlite::Result<rusqlite::Connection> {
-    let db_path = std::env::temp_dir().join("axiom_shared.db");
-    let conn = rusqlite::Connection::open(db_path)?;
-    
-    // Activity Log Table
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS activity_log (
-            id TEXT PRIMARY KEY, employee_name TEXT, department TEXT, file_name TEXT,
-            detection_count INTEGER, highest_severity TEXT, timestamp INTEGER, redacted BOOLEAN, pii_types TEXT
-        )", [],
-    )?;
-
-    // Employees Table (NEW)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS employees (
-            id TEXT PRIMARY KEY, name TEXT, username TEXT UNIQUE, password TEXT,
-            department TEXT, status TEXT, last_seen INTEGER, total_scans INTEGER,
-            total_detections INTEGER, risk_score INTEGER, avatar_initials TEXT
-        )", [],
-    )?;
-
-    // Create a default admin user if the table is empty
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM employees", [], |row| row.get(0))?;
-    if count == 0 {
-        let _ = conn.execute(
-            "INSERT INTO employees (id, name, username, password, department, status, last_seen, total_scans, total_detections, risk_score, avatar_initials)
-             VALUES ('e_admin', 'Admin User', 'admin', 'password', 'IT', 'active', 0, 0, 0, 0, 'AD')", []
-        );
-    }
-    
-    Ok(conn)
-}
-
 fn timestamp_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn severity_from_str(s: &str) -> Severity {
@@ -175,100 +144,90 @@ fn severity_from_str(s: &str) -> Severity {
     }
 }
 
+fn severity_label(sev: &Severity) -> &'static str {
+    match sev {
+        Severity::Critical => "CRITICAL",
+        Severity::High     => "HIGH",
+        Severity::Medium   => "MEDIUM",
+        Severity::Low      => "LOW",
+    }
+}
+
+fn highest_severity(dets: &[Detection]) -> Severity {
+    let rank = |s: &Severity| match s {
+        Severity::Critical => 3,
+        Severity::High     => 2,
+        Severity::Medium   => 1,
+        Severity::Low      => 0,
+    };
+    dets.iter()
+        .max_by_key(|d| rank(&d.severity))
+        .map(|d| d.severity.clone())
+        .unwrap_or(Severity::Low)
+}
+
 fn get_preview_pdf_path() -> Option<String> {
     const EXTS: &[&str] = &[".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"];
 
-    // Each entry: (app name, how to get the POSIX path of the front document)
-    // Preview uses `file of front document` → coerce to alias → POSIX path
-    // Office apps use `full name of front document` which is already a POSIX path
     let script = r#"
         set posixPath to ""
-
         try
             if application "Numbers" is running then
                 set posixPath to run script "tell application \"Numbers\" to get path of front document"
                 if posixPath is not "" then return posixPath
             end if
         end try
-
         try
             if application "Preview" is running then
                 set posixPath to run script "tell application \"Preview\" to get path of front document"
                 if posixPath is not "" then return posixPath
             end if
         end try
-
-        
-
         try
             if application "Microsoft Excel" is running then
                 set posixPath to run script "tell application \"Microsoft Excel\" to get full name of active workbook"
                 if posixPath is not "" then return posixPath
             end if
         end try
-
+        try
+            if application "Microsoft Word" is running then
+                set posixPath to run script "tell application \"Microsoft Word\" to get full name of active document"
+                if posixPath is not "" then return posixPath
+            end if
+        end try
         try
             if application "Microsoft PowerPoint" is running then
                 set posixPath to run script "tell application \"Microsoft PowerPoint\" to get full name of active presentation"
                 if posixPath is not "" then return posixPath
             end if
         end try
-
         try
             if application "Pages" is running then
                 set posixPath to run script "tell application \"Pages\" to get POSIX path of (file of front document as alias)"
                 if posixPath is not "" then return posixPath
             end if
         end try
-
-        try
-            if application "Numbers" is running then
-                set posixPath to run script "tell application \"Numbers\" to get POSIX path of (file of front document as alias)"
-                if posixPath is not "" then return posixPath
-            end if
-        end try
-
         try
             if application "Keynote" is running then
                 set posixPath to run script "tell application \"Keynote\" to get POSIX path of (file of front document as alias)"
                 if posixPath is not "" then return posixPath
             end if
         end try
-
         return posixPath
     "#;
 
-    // Write to a temp file — passing multi-line scripts via -e causes parse errors
     let script_path = std::env::temp_dir().join("axiom_detect.scpt");
-    if std::fs::write(&script_path, script).is_err() {
-        return None;
-    }
+    if std::fs::write(&script_path, script).is_err() { return None; }
 
-    let output = Command::new("osascript")
-        .arg(&script_path)
-        .output()
-        .ok()?;
-
-    // Log stderr to help debug AppleScript errors
+    let output = Command::new("osascript").arg(&script_path).output().ok()?;
     let err_out = String::from_utf8_lossy(&output.stderr);
     if !err_out.trim().is_empty() {
         eprintln!("[Axiom] AppleScript stderr: {}", err_out.trim());
     }
-
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    eprintln!("[Axiom] AppleScript raw output: {:?}", path);
-
-    if path.is_empty() {
-        return None;
-    }
-
+    if path.is_empty() { return None; }
     let path_lower = path.to_lowercase();
-    if EXTS.iter().any(|ext| path_lower.ends_with(ext)) {
-        Some(path)
-    } else {
-        eprintln!("[Axiom] Unsupported extension, ignoring: {:?}", path);
-        None
-    }
+    if EXTS.iter().any(|ext| path_lower.ends_with(ext)) { Some(path) } else { None }
 }
 
 fn get_clipboard_text() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -321,28 +280,26 @@ fn scan_clipboard_for_pii(text: &str) -> Vec<Detection> {
 
 fn find_python() -> String { "python3".to_string() }
 
+fn resolve_script(rel_path: &str) -> std::path::PathBuf {
+    let mut base = std::env::current_dir().unwrap_or_default();
+    if base.ends_with("src-tauri") { base.pop(); }
+    base.join(rel_path)
+}
+
 fn spawn_pdf_scanner(script_path: &str) -> anyhow::Result<(PdfScanProcess, Option<String>, Option<String>)> {
     let python = find_python();
-    let mut base_path = std::env::current_dir().unwrap_or_default();
-    if base_path.ends_with("src-tauri") { base_path.pop(); }
-    let absolute_script_path = base_path.join(script_path);
-
     let mut child = Command::new(&python)
-        .arg(absolute_script_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .arg(resolve_script(script_path))
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
         .spawn()?;
 
-    let stdin = child.stdin.take().unwrap();
-    let stdout_raw = child.stdout.take().unwrap();
-    let mut stdout = BufReader::new(stdout_raw);
+    let stdin  = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     let mut line = String::new();
     loop {
         line.clear();
-        let n = stdout.read_line(&mut line)?;
-        if n == 0 { anyhow::bail!("Subprocess exited immediately"); }
+        if stdout.read_line(&mut line)? == 0 { anyhow::bail!("Subprocess exited immediately"); }
         let t = line.trim();
         if t.is_empty() { continue; }
         let resp: PyResponse = serde_json::from_str(t)?;
@@ -353,26 +310,18 @@ fn spawn_pdf_scanner(script_path: &str) -> anyhow::Result<(PdfScanProcess, Optio
 
 fn spawn_redactor() -> anyhow::Result<PdfScanProcess> {
     let python = find_python();
-    let mut base_path = std::env::current_dir().unwrap_or_default();
-    if base_path.ends_with("src-tauri") { base_path.pop(); }
-    let script = base_path.join("scripts/redact_document.py");
-
     let mut child = Command::new(&python)
-        .arg(script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .arg(resolve_script("scripts/redact_document.py"))
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
         .spawn()?;
 
-    let stdin = child.stdin.take().unwrap();
-    let stdout_raw = child.stdout.take().unwrap();
-    let mut stdout = BufReader::new(stdout_raw);
+    let stdin  = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     let mut line = String::new();
     loop {
         line.clear();
-        let n = stdout.read_line(&mut line)?;
-        if n == 0 { anyhow::bail!("Redactor exited immediately"); }
+        if stdout.read_line(&mut line)? == 0 { anyhow::bail!("Redactor exited immediately"); }
         let t = line.trim();
         if t.is_empty() { continue; }
         let resp: serde_json::Value = serde_json::from_str(t)?;
@@ -385,23 +334,66 @@ fn spawn_redactor() -> anyhow::Result<PdfScanProcess> {
     Ok(PdfScanProcess { child, stdin, stdout })
 }
 
+/// Spawn the Firebase uploader subprocess and wait for its "ready" handshake.
+fn spawn_firebase_uploader() -> anyhow::Result<PdfScanProcess> {
+    let python = find_python();
+    let mut child = Command::new(&python)
+        .arg(resolve_script("scripts/firebase_uploader.py"))
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+        .spawn()?;
+
+    let stdin  = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdout.read_line(&mut line)? == 0 { anyhow::bail!("Firebase uploader exited immediately"); }
+        let t = line.trim();
+        if t.is_empty() { continue; }
+        let resp: serde_json::Value = serde_json::from_str(t)?;
+        if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
+            if !err.is_empty() { anyhow::bail!("Firebase uploader init error: {err}"); }
+        }
+        if resp.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) { break; }
+    }
+
+    Ok(PdfScanProcess { child, stdin, stdout })
+}
+
 fn query_subprocess(proc: &mut PdfScanProcess, req_id: &str, pdf_path: &str) -> anyhow::Result<PyResponse> {
     let req = serde_json::json!({ "id": req_id, "pdf_path": pdf_path });
-    let mut line_out = serde_json::to_string(&req)?;
-    line_out.push('\n');
-    proc.stdin.write_all(line_out.as_bytes())?;
+    let mut out = serde_json::to_string(&req)?;
+    out.push('\n');
+    proc.stdin.write_all(out.as_bytes())?;
     proc.stdin.flush()?;
 
     let mut resp_line = String::new();
     loop {
         resp_line.clear();
-        let n = proc.stdout.read_line(&mut resp_line)?;
-        if n == 0 { anyhow::bail!("Subprocess closed stdout unexpectedly"); }
+        if proc.stdout.read_line(&mut resp_line)? == 0 { anyhow::bail!("Subprocess closed stdout"); }
         let t = resp_line.trim();
         if t.is_empty() { continue; }
         let resp: PyResponse = serde_json::from_str(t)?;
         if let Some(err) = resp.error { anyhow::bail!("Subprocess error: {err}"); }
         return Ok(resp);
+    }
+}
+
+/// Send a JSON request to the Firebase subprocess and read one response line.
+fn firebase_send(proc: &mut PdfScanProcess, req: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let mut out = serde_json::to_string(&req)?;
+    out.push('\n');
+    proc.stdin.write_all(out.as_bytes())?;
+    proc.stdin.flush()?;
+
+    let mut resp_line = String::new();
+    loop {
+        resp_line.clear();
+        if proc.stdout.read_line(&mut resp_line)? == 0 { anyhow::bail!("Firebase subprocess closed"); }
+        let t = resp_line.trim();
+        if t.is_empty() { continue; }
+        return Ok(serde_json::from_str(t)?);
     }
 }
 
@@ -421,33 +413,44 @@ fn py_to_detections(items: Vec<PyDetection>) -> Vec<Detection> {
     }).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
 mod commands {
     use super::*;
 
+    /// Authenticate an employee via Firebase.
     #[tauri::command]
-    pub fn login(username: String, pass: String) -> Result<serde_json::Value, String> {
-        let conn = init_shared_db().map_err(|e| e.to_string())?;
-        
-        let mut stmt = conn.prepare("SELECT id, name, department FROM employees WHERE username = ?1 AND password = ?2 AND status = 'active'").unwrap();
-        let mut rows = stmt.query(rusqlite::params![username, pass]).unwrap();
-        
-        if let Some(row) = rows.next().unwrap() {
-            let id: String = row.get(0).unwrap();
-            let name: String = row.get(1).unwrap();
-            let dept: String = row.get(2).unwrap();
-            Ok(serde_json::json!({ "id": id, "name": name, "department": dept }))
+    pub async fn login(
+        state: State<'_, AppState>,
+        username: String,
+        pass: String,
+    ) -> Result<serde_json::Value, String> {
+        let mut guard = state.firebase_process.lock().map_err(|e| e.to_string())?;
+        if guard.is_none() {
+            let proc = spawn_firebase_uploader().map_err(|e| e.to_string())?;
+            *guard = Some(proc);
+        }
+        let proc = guard.as_mut().unwrap();
+        let req_id = format!("login-{}", timestamp_ms());
+        let req = serde_json::json!({ "id": req_id, "op": "login", "username": username, "password": pass });
+        let resp = firebase_send(proc, req).map_err(|e| e.to_string())?;
+
+        if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            Ok(resp["user"].clone())
         } else {
-            Err("Invalid credentials or account suspended.".into())
+            Err(resp["error"].as_str().unwrap_or("Login failed").to_string())
         }
     }
 
     #[tauri::command]
     pub async fn start_scanning(
-        app: AppHandle, 
+        app: AppHandle,
         state: State<'_, AppState>,
         emp_id: String,
         emp_name: String,
-        emp_dept: String
+        emp_dept: String,
     ) -> Result<(), String> {
         {
             let mut s = state.scanning.lock().map_err(|e| e.to_string())?;
@@ -455,8 +458,18 @@ mod commands {
             *s = true;
         }
 
+        // Ensure Firebase subprocess is alive before spinning up the scan thread.
+        {
+            let mut guard = state.firebase_process.lock().map_err(|e| e.to_string())?;
+            if guard.is_none() {
+                let proc = spawn_firebase_uploader().map_err(|e| e.to_string())?;
+                *guard = Some(proc);
+            }
+        }
+
         let flag              = Arc::clone(&state.scanning);
         let py_proc_arc       = Arc::clone(&state.py_process);
+        let fb_proc_arc       = Arc::clone(&state.firebase_process);
         let ready_arc         = Arc::clone(&state.model_ready);
         let pdf_path_arc      = Arc::clone(&state.last_pdf_path);
         let dets_arc          = Arc::clone(&state.last_detections);
@@ -466,40 +479,37 @@ mod commands {
         let handle            = app.clone();
 
         thread::spawn(move || {
+            // Spawn Gemma scanner
             let (proc, gemma_model_id, gemma_device) = match spawn_pdf_scanner("scripts/pdf_scanner.py") {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = handle.emit_to("main", "paligemma_error", e.to_string());
+                    let _ = handle.emit("paligemma_error", e.to_string());
                     if let Ok(mut s) = flag.lock() { *s = false; }
                     return;
                 }
             };
 
-            if let Ok(mut g) = py_proc_arc.lock() { *g = Some(proc); }
-            if let Ok(mut r) = ready_arc.lock()   { *r = true; }
-            if let Ok(mut m) = model_id_arc.lock() { *m = gemma_model_id; }
-            if let Ok(mut d) = device_arc.lock()   { *d = gemma_device; }
+            if let Ok(mut g) = py_proc_arc.lock()  { *g = Some(proc); }
+            if let Ok(mut r) = ready_arc.lock()     { *r = true; }
+            if let Ok(mut m) = model_id_arc.lock()  { *m = gemma_model_id; }
+            if let Ok(mut d) = device_arc.lock()    { *d = gemma_device; }
 
             let model_id_val = model_id_arc.lock().ok().and_then(|g| g.clone());
             let device_val   = device_arc.lock().ok().and_then(|g| g.clone());
-            let _ = handle.emit_to("main", "paligemma_ready", serde_json::json!({
-                "model_id": model_id_val,
-                "device":   device_val,
+            let _ = handle.emit("paligemma_ready", serde_json::json!({
+                "model_id": model_id_val, "device": device_val,
             }));
 
             let mut req_counter: u64 = 0;
-            let mut last_scanned_path: Option<String> = None;
 
             while *flag.lock().unwrap() {
-                let pdf_path = get_preview_pdf_path().unwrap_or_default();
-                if pdf_path.is_empty() || pdf_path.contains("_redacted") {
-                    thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
+                let pdf_path = match get_preview_pdf_path() {
+                    Some(p) if !p.is_empty() && !p.contains("_redacted") => p,
+                    _ => { thread::sleep(Duration::from_secs(2)); continue; }
+                };
 
-                // Deduplication check
                 {
-                    let mut cache = scanned_paths_arc.lock().unwrap(); 
+                    let mut cache = scanned_paths_arc.lock().unwrap();
                     if cache.contains(&pdf_path) {
                         thread::sleep(Duration::from_secs(3));
                         continue;
@@ -507,12 +517,13 @@ mod commands {
                     cache.insert(pdf_path.clone());
                 }
 
-                if Some(&pdf_path) == last_scanned_path.as_ref() {
-                    thread::sleep(Duration::from_secs(3));
-                    continue;
-                }
-
-                let _ = handle.emit_to("main", "preview_status", serde_json::json!({"status": "scanning", "message": format!("Scanning: {}", pdf_path.split('/').last().unwrap_or(&pdf_path))}));
+                let file_name = pdf_path.split('/').last().unwrap_or(&pdf_path).to_string();
+                let _ = handle.emit("file_detected", serde_json::json!({
+                    "path": pdf_path, "file_name": file_name,
+                }));
+                let _ = handle.emit("preview_status", serde_json::json!({
+                    "message": format!("Scanning: {}", file_name),
+                }));
 
                 if let Ok(mut p) = pdf_path_arc.lock() { *p = Some(pdf_path.clone()); }
 
@@ -525,7 +536,7 @@ mod commands {
                         Some(proc) => match query_subprocess(proc, &req_id, &pdf_path) {
                             Ok(r) => (r.detections, r.gemma_log),
                             Err(e) => {
-                                let _ = handle.emit_to("main", "paligemma_error", e.to_string());
+                                let _ = handle.emit("paligemma_error", e.to_string());
                                 (Vec::new(), Vec::new())
                             }
                         },
@@ -533,23 +544,25 @@ mod commands {
                     }
                 };
 
-                last_scanned_path = Some(pdf_path.clone());
                 let mut all_det = py_to_detections(py_dets);
+                if let Ok(cb) = get_clipboard_text() {
+                    all_det.append(&mut scan_clipboard_for_pii(&cb));
+                }
 
+                // Cache raw detections for redaction
                 if let Ok(mut d) = dets_arc.lock() {
                     *d = all_det.iter().map(|det| serde_json::json!({
                         "label":     det.pattern_name,
-                        "severity":  format!("{:?}", det.severity),
+                        "severity":  severity_label(&det.severity),
                         "raw_value": det.raw_value,
                         "page":      det.page.unwrap_or(1),
                     })).collect();
                 }
 
-                if let Ok(cb) = get_clipboard_text() {
-                    all_det.append(&mut scan_clipboard_for_pii(&cb));
-                }
-
-                let snippet = all_det.iter().map(|d| format!("[{}] {}", d.pattern_name, d.matched_text)).collect::<Vec<_>>().join(", ");
+                // Emit scan result to frontend
+                let snippet = all_det.iter()
+                    .map(|d| format!("[{}] {}", d.pattern_name, d.matched_text))
+                    .collect::<Vec<_>>().join(", ");
                 let payload = ScanResult {
                     detections: all_det.clone(),
                     raw_text_snippet: snippet,
@@ -558,49 +571,44 @@ mod commands {
                     model_id: model_id_arc.lock().ok().and_then(|g| g.clone()),
                     device:   device_arc.lock().ok().and_then(|g| g.clone()),
                 };
+                let _ = handle.emit("scan_result", &payload);
 
-                let _ = handle.emit_to("main", "scan_result", &payload);
-
-                // --- Write the scan result to the shared SQL database ---
+                // Persist activity log to Firebase (fire-and-forget)
                 if !all_det.is_empty() {
-                    if let Ok(conn) = init_shared_db() {
-                        let highest_sev = all_det.iter()
-                            .map(|d| d.severity.clone())
-                            .max_by_key(|s| match s {
-                                Severity::Critical => 3,
-                                Severity::High => 2,
-                                Severity::Medium => 1,
-                                _ => 0,
-                            }).unwrap_or(Severity::Low);
+                    let top_sev  = highest_severity(&all_det);
+                    let pii_types: Vec<String> = {
+                        let mut seen = std::collections::HashSet::new();
+                        all_det.iter().filter_map(|d| {
+                            if seen.insert(d.pattern_name.clone()) { Some(d.pattern_name.clone()) } else { None }
+                        }).collect()
+                    };
 
-                        let pii_types: Vec<String> = all_det.iter().map(|d| d.pattern_name.clone()).collect();
-                        let unique_pii: std::collections::HashSet<_> = pii_types.into_iter().collect();
-                        let pii_string = unique_pii.into_iter().collect::<Vec<_>>().join(";");
-                        
-                        let file_name = pdf_path.split('/').last().unwrap_or(&pdf_path);
-                        
-                        let _ = conn.execute(
-                            "INSERT INTO activity_log (id, employee_name, department, file_name, detection_count, highest_severity, timestamp, redacted, pii_types) 
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                            rusqlite::params![
-                                req_id,
-                                emp_name.clone(), 
-                                emp_dept.clone(), 
-                                file_name,
-                                all_det.len() as u32,
-                                format!("{:?}", highest_sev).to_uppercase(),
-                                timestamp_ms(),
-                                false, 
-                                pii_string
-                            ],
-                        );
+                    let log_id  = format!("log_{}", timestamp_ms());
+                    let fb_req  = serde_json::json!({
+                        "id":   log_id.clone(),
+                        "op":   "log_activity",
+                        "data": {
+                            "id":               log_id,
+                            "employee_id":      emp_id,
+                            "employee_name":    emp_name,
+                            "department":       emp_dept,
+                            "file_name":        file_name,
+                            "detection_count":  all_det.len(),
+                            "highest_severity": severity_label(&top_sev),
+                            "timestamp":        timestamp_ms(),
+                            "redacted":         false,
+                            "pii_types":        pii_types,
+                        }
+                    });
+
+                    let mut guard = fb_proc_arc.lock().unwrap();
+                    if let Some(proc) = guard.as_mut() {
+                        let _ = firebase_send(proc, fb_req);
                     }
                 }
-                // -------------------------------------------------------------
 
                 thread::sleep(Duration::from_secs(3));
             }
-
         });
 
         Ok(())
@@ -620,12 +628,16 @@ mod commands {
     }
 
     #[tauri::command]
-    pub async fn scan_manual_file(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<(), String> {
+    pub async fn scan_manual_file(
+        app: AppHandle,
+        state: State<'_, AppState>,
+        path: String,
+    ) -> Result<(), String> {
         let req_id = format!("manual-{}", timestamp_ms());
-        
+
         let (py_dets, gemma_log) = {
             let mut guard = state.py_process.lock().map_err(|e| e.to_string())?;
-            let proc = guard.as_mut().ok_or("Pipeline not running. Click 'Watch Active App' first.")?;
+            let proc = guard.as_mut().ok_or("Pipeline not running. Click 'Run Detection Alg' first.")?;
             match query_subprocess(proc, &req_id, &path) {
                 Ok(r) => (r.detections, r.gemma_log),
                 Err(e) => return Err(e.to_string()),
@@ -633,32 +645,32 @@ mod commands {
         };
 
         let all_det = py_to_detections(py_dets);
-        
+
         if let Ok(mut d) = state.last_detections.lock() {
             *d = all_det.iter().map(|det| serde_json::json!({
                 "label":     det.pattern_name,
-                "severity":  format!("{:?}", det.severity),
+                "severity":  severity_label(&det.severity),
                 "raw_value": det.raw_value,
                 "page":      det.page.unwrap_or(1),
             })).collect();
         }
 
         if let Ok(mut p) = state.last_pdf_path.lock() { *p = Some(path.clone()); }
+        if let Ok(mut cache) = state.scanned_paths.lock() { cache.insert(path.clone()); }
 
-        let snippet = all_det.iter().map(|d| format!("[{}] {}", d.pattern_name, d.matched_text)).collect::<Vec<_>>().join(", ");
+        let snippet = all_det.iter()
+            .map(|d| format!("[{}] {}", d.pattern_name, d.matched_text))
+            .collect::<Vec<_>>().join(", ");
         let payload = ScanResult {
             detections: all_det,
             raw_text_snippet: snippet,
-            pdf_path: Some(path.clone()),
+            pdf_path: Some(path),
             gemma_log,
             model_id: state.model_id.lock().ok().and_then(|g| g.clone()),
             device:   state.device.lock().ok().and_then(|g| g.clone()),
         };
 
-        let _ = app.emit_to("main", "scan_result", &payload);
-
-        if let Ok(mut cache) = state.scanned_paths.lock() { cache.insert(path); }
-
+        let _ = app.emit("scan_result", &payload);
         Ok(())
     }
 
@@ -671,18 +683,13 @@ mod commands {
     #[tauri::command]
     pub async fn open_in_preview(path: String) -> Result<(), String> {
         let ext = std::path::Path::new(&path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+            .extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         if ext == "pdf" {
-            std::process::Command::new("osascript")
+            Command::new("osascript")
                 .arg("-e").arg(format!(r#"tell application "Preview" to open POSIX file "{path}""#))
                 .spawn().map_err(|e| e.to_string())?;
         } else {
-            std::process::Command::new("open")
-                .arg(&path)
-                .spawn().map_err(|e| e.to_string())?;
+            Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -691,6 +698,50 @@ mod commands {
     pub async fn save_redacted_document(temp_path: String, dest_path: String) -> Result<(), String> {
         std::fs::copy(&temp_path, &dest_path).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+
+
+    /// Mark an activity log entry as redacted in Firestore
+    #[tauri::command]
+    pub fn mark_activity_redacted(state: State<'_, AppState'>, log_id: String) -> Result<(), String> {
+        let mut guard = state.firebase_process.lock().map_err(|e| e.to_string())?;
+        if guard.is_none() {
+            let proc = spawn_firebase_uploader().map_err(|e| e.to_string())?;
+            *guard = Some(proc);
+        }
+        let proc = guard.as_mut().unwrap();
+        let req = serde_json::json!({
+            "id":     format!("mr-{}", timestamp_ms()),
+            "op":     "mark_redacted",
+            "doc_id": log_id,
+        });
+        firebase_send(proc, req).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Save the employee's file log history to ~/.axiom_logs.json
+    #[tauri::command]
+    pub fn save_file_logs(logs: serde_json::Value) -> Result<(), String> {
+        let path = dirs::home_dir()
+            .ok_or("Cannot find home directory")?
+            .join(".axiom_logs.json");
+        let json = serde_json::to_string(&logs).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Load the employee's file log history from ~/.axiom_logs.json
+    #[tauri::command]
+    pub fn load_file_logs() -> Result<serde_json::Value, String> {
+        let path = dirs::home_dir()
+            .ok_or("Cannot find home directory")?
+            .join(".axiom_logs.json");
+        if !path.exists() {
+            return Ok(serde_json::Value::Array(vec![]));
+        }
+        let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&json).map_err(|e| e.to_string())
     }
 
     #[tauri::command]
@@ -708,9 +759,9 @@ mod commands {
             *guard = Some(proc);
         }
 
-        let proc = guard.as_mut().unwrap();
+        let proc   = guard.as_mut().unwrap();
         let req_id = format!("redact-{}", timestamp_ms());
-        let req = serde_json::json!({ "id": req_id, "source_path": source_path, "detections": detections });
+        let req    = serde_json::json!({ "id": req_id, "source_path": source_path, "detections": detections });
         let mut req_str = serde_json::to_string(&req).map_err(|e| e.to_string())?;
         req_str.push('\n');
         proc.stdin.write_all(req_str.as_bytes()).map_err(|e| e.to_string())?;
@@ -719,16 +770,16 @@ mod commands {
         let mut resp_line = String::new();
         loop {
             resp_line.clear();
-            let n = proc.stdout.read_line(&mut resp_line).map_err(|e| e.to_string())?;
-            if n == 0 { return Err("Redactor subprocess closed".into()); }
+            if proc.stdout.read_line(&mut resp_line).map_err(|e| e.to_string())? == 0 {
+                return Err("Redactor subprocess closed".into());
+            }
             let t = resp_line.trim();
             if t.is_empty() { continue; }
             let resp: serde_json::Value = serde_json::from_str(t).map_err(|e| e.to_string())?;
             if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
                 if !err.is_empty() { return Err(err.to_string()); }
             }
-            let redacted_path = resp.get("redacted_path").and_then(|p| p.as_str()).ok_or("No redacted_path in response")?.to_string();
-            return Ok(redacted_path);
+            return Ok(resp["redacted_path"].as_str().ok_or("No redacted_path")?.to_string());
         }
     }
 }
@@ -740,18 +791,21 @@ mod commands {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())       
-        .plugin(tauri_plugin_notification::init()) 
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
-            commands::login,                   // <--- Added login command
+            commands::login,
             commands::start_scanning,
             commands::stop_scanning,
             commands::scan_clipboard_now,
             commands::scan_manual_file,
             commands::redact_document,
-            commands::open_in_preview,         
-            commands::save_redacted_document,  
+            commands::open_in_preview,
+            commands::save_redacted_document,
+            commands::save_file_logs,
+            commands::load_file_logs,
+            commands::mark_activity_redacted,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Axiom");
