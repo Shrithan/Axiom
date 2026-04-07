@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>IllegalLocationConstraintException</Code><Message>The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>6V2MTNQNZZBF10WA</RequestId><HostId>MV+6cpDGyFajSETZVm6y6MuHYAA/wKhWAh54EVIONdnIauLFfoNPac6aaEigStkq2/SsxL/OU7supZ9sFmaoUoiuAEiq+P89</HostId></Error>
