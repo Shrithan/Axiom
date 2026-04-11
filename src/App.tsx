@@ -1,15 +1,5 @@
 // src/App.tsx
-// Axiom v2 — Local-first Data Leakage Prevention (VLM edition)
-//
-// Detection is now fully done server-side in Rust:
-//   screenshot → base64 → Ollama VLM → JSON detections → overlay
-//
-// This frontend only:
-//   1. Starts/stops scanning via Tauri commands
-//   2. Listens for "scan_result" events and renders detection cards
-//   3. Renders the transparent overlay canvas in the overlay window
-//
-// No AI inference happens in the browser.
+// Axiom v4 — Preview PDF Data Leakage Prevention
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -17,17 +7,11 @@ import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 // ---------------------------------------------------------------------------
-// Types — mirror Rust structs exactly
+// Types
 // ---------------------------------------------------------------------------
 
 type Severity = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
-type DetectionSource = "screen" | "clipboard";
-
-interface BoundingBox {
-  x: number; y: number;
-  width: number; height: number;
-  screen_width: number; screen_height: number;
-}
+type DetectionSource = "pdf" | "clipboard";
 
 interface Detection {
   id: string;
@@ -35,136 +19,113 @@ interface Detection {
   matched_text: string;
   severity: Severity;
   source: DetectionSource;
-  bbox: BoundingBox | null;
+  page: number | null;
   timestamp_ms: number;
 }
 
 interface ScanResult {
   detections: Detection[];
   raw_text_snippet: string;
+  pdf_path: string | null;
 }
 
 interface ModelInfo {
   model: string;
-  ollama_url: string;
+  script_path: string;
+  ready: boolean;
+}
+
+interface PreviewStatus {
+  status: "waiting" | "scanning" | "done";
+  message: string;
 }
 
 // ---------------------------------------------------------------------------
-// Constants / theme
+// Theme
 // ---------------------------------------------------------------------------
 
-const SEV_COLOR: Record<Severity, string> = {
-  LOW:      "rgba(59,130,246,0.25)",
-  MEDIUM:   "rgba(234,179,8,0.35)",
-  HIGH:     "rgba(249,115,22,0.45)",
-  CRITICAL: "rgba(239,68,68,0.55)",
-};
 const SEV_BORDER: Record<Severity, string> = {
   LOW: "#3b82f6", MEDIUM: "#eab308", HIGH: "#f97316", CRITICAL: "#ef4444",
 };
-const SEV_ORDER: Record<Severity, number> = {
-  CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1,
-};
-const SEV_LABEL: Record<Severity, string> = {
-  LOW: "Low", MEDIUM: "Med", HIGH: "High", CRITICAL: "CRIT",
-};
+const SEV_ORDER: Record<Severity, number> = { CRITICAL:4, HIGH:3, MEDIUM:2, LOW:1 };
+const SEV_LABEL: Record<Severity, string> = { LOW:"Low", MEDIUM:"Med", HIGH:"High", CRITICAL:"CRIT" };
+
+const IS_OVERLAY = getCurrentWebviewWindow().label === "overlay";
 
 // ---------------------------------------------------------------------------
-// Routing
-// ---------------------------------------------------------------------------
-
-const IS_OVERLAY = window.location.pathname === "/overlay";
-
-// ---------------------------------------------------------------------------
-// OVERLAY PAGE
-// Transparent full-screen canvas with highlight boxes.
+// Overlay — shows a warning badge when PII is found in the open PDF
 // ---------------------------------------------------------------------------
 
 function OverlayPage() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  const draw = useCallback((detections: Detection[]) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    canvas.width  = window.screen.width;
-    canvas.height = window.screen.height;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    const hits = detections
-      .filter(d => d.source === "screen" && d.bbox)
-      .sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity]);
-
-    for (const d of hits) {
-      const bbox = d.bbox!;
-      const sev  = d.severity;
-
-      // bbox coords are already in pixels (set by Rust from normalised VLM output)
-      const scaleX = canvas.width  / bbox.screen_width;
-      const scaleY = canvas.height / bbox.screen_height;
-      const pad = 6;
-      const rx = bbox.x * scaleX - pad;
-      const ry = bbox.y * scaleY - pad;
-      const rw = bbox.width  * scaleX + pad * 2;
-      const rh = bbox.height * scaleY + pad * 2;
-
-      // Glow
-      ctx.shadowColor = SEV_BORDER[sev];
-      ctx.shadowBlur  = sev === "CRITICAL" ? 14 : 7;
-
-      // Fill
-      ctx.fillStyle = SEV_COLOR[sev];
-      ctx.beginPath();
-      ctx.roundRect(rx, ry, rw, rh, 5);
-      ctx.fill();
-
-      // Border
-      ctx.shadowBlur  = 0;
-      ctx.strokeStyle = SEV_BORDER[sev];
-      ctx.lineWidth   = sev === "CRITICAL" ? 2.5 : 1.5;
-      ctx.beginPath();
-      ctx.roundRect(rx, ry, rw, rh, 5);
-      ctx.stroke();
-
-      // Label badge
-      const label = `${SEV_LABEL[sev]}: ${d.pattern_name.replace(/_/g, " ")}`;
-      ctx.font = "bold 11px 'SF Mono', 'Fira Code', monospace";
-      const tw = ctx.measureText(label).width;
-      const bw = tw + 12, bh = 20;
-      const bx = rx, by = Math.max(0, ry - bh - 3);
-
-      ctx.fillStyle = SEV_BORDER[sev];
-      ctx.beginPath();
-      ctx.roundRect(bx, by, bw, bh, 3);
-      ctx.fill();
-      ctx.fillStyle = "#ffffff";
-      ctx.fillText(label, bx + 6, by + 14);
-    }
-  }, []);
+  const [detectionCount, setDetectionCount] = useState(0);
+  const [criticalCount,  setCriticalCount]  = useState(0);
+  const [pdfName,        setPdfName]        = useState<string | null>(null);
+  const [visible,        setVisible]        = useState(false);
 
   useEffect(() => {
+    const win = getCurrentWebviewWindow();
     const unsubs: UnlistenFn[] = [];
     (async () => {
-      const win = getCurrentWebviewWindow();
-      unsubs.push(await win.listen<ScanResult>("scan_result", e => draw(e.payload.detections)));
+      unsubs.push(await win.listen<ScanResult>("scan_result", e => {
+        const dets = e.payload.detections;
+        const crits = dets.filter(d => d.severity === "CRITICAL").length;
+        setDetectionCount(dets.length);
+        setCriticalCount(crits);
+        setPdfName(e.payload.pdf_path?.split("/").pop() ?? null);
+        setVisible(dets.length > 0);
+      }));
       unsubs.push(await win.listen("clear_overlay", () => {
-        const canvas = canvasRef.current;
-        if (canvas) {
-          const ctx = canvas.getContext("2d");
-          ctx?.clearRect(0, 0, canvas.width, canvas.height);
-        }
+        setVisible(false);
+        setDetectionCount(0);
       }));
     })();
     return () => unsubs.forEach(u => u());
-  }, [draw]);
+  }, []);
+
+  if (!visible) return null;
 
   return (
-    <canvas
-      ref={canvasRef}
-      style={{ position: "fixed", inset: 0, pointerEvents: "none", background: "transparent" }}
-    />
+    <div style={{
+      position: "fixed", top: 20, right: 20,
+      pointerEvents: "none",
+      display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end",
+    }}>
+      {/* Main badge */}
+      <div style={{
+        background: criticalCount > 0 ? "rgba(127,29,29,0.95)" : "rgba(120,53,15,0.95)",
+        border: `2px solid ${criticalCount > 0 ? "#ef4444" : "#f97316"}`,
+        borderRadius: 10, padding: "10px 14px",
+        display: "flex", alignItems: "center", gap: 10,
+        boxShadow: `0 0 20px ${criticalCount > 0 ? "#ef444466" : "#f9731666"}`,
+        backdropFilter: "blur(8px)",
+      }}>
+        <span style={{ fontSize: 22 }}>{criticalCount > 0 ? "🚨" : "⚠️"}</span>
+        <div>
+          <div style={{
+            fontSize: 13, fontWeight: 800, color: "#fff",
+            fontFamily: "monospace", letterSpacing: "0.05em",
+          }}>
+            {detectionCount} PII ITEM{detectionCount !== 1 ? "S" : ""} DETECTED
+          </div>
+          {pdfName && (
+            <div style={{ fontSize: 10, color: "#fca5a5", marginTop: 2 }}>
+              in {pdfName}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Severity breakdown */}
+      {criticalCount > 0 && (
+        <div style={{
+          background: "rgba(0,0,0,0.8)", border: "1px solid #991b1b",
+          borderRadius: 6, padding: "4px 10px",
+          fontSize: 10, color: "#fca5a5", fontFamily: "monospace",
+        }}>
+          ⚡ {criticalCount} CRITICAL — check Axiom panel
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -174,105 +135,137 @@ function OverlayPage() {
 
 function DetectionCard({ d }: { d: Detection }) {
   const sev = d.severity;
-  const age = Math.round((Date.now() - d.timestamp_ms) / 1000);
-
   return (
     <div style={{
       background: "#111827",
       border: `1px solid ${SEV_BORDER[sev]}33`,
       borderLeft: `3px solid ${SEV_BORDER[sev]}`,
-      borderRadius: 7,
-      padding: "9px 11px",
-      marginBottom: 6,
+      borderRadius: 7, padding: "9px 11px", marginBottom: 6,
       animation: "fadeIn 0.2s ease",
     }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-        <span style={{ fontSize: 11, fontWeight: 700, color: SEV_BORDER[sev], fontFamily: "monospace", letterSpacing: "0.04em" }}>
-          {d.pattern_name.replace(/_/g, " ")}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
+        <span style={{ fontSize:11, fontWeight:700, color:SEV_BORDER[sev], fontFamily:"monospace", letterSpacing:"0.04em" }}>
+          {d.pattern_name.replace(/_/g," ")}
         </span>
-        <span style={{
-          fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 99,
-          background: SEV_BORDER[sev] + "22", color: SEV_BORDER[sev],
-        }}>
-          {SEV_LABEL[sev]}
-        </span>
+        <div style={{ display:"flex", gap:5, alignItems:"center" }}>
+          {d.page && (
+            <span style={{ fontSize:9, color:"#475569", fontFamily:"monospace" }}>p.{d.page}</span>
+          )}
+          <span style={{ fontSize:9, fontWeight:700, padding:"1px 5px", borderRadius:99,
+            background: SEV_BORDER[sev]+"22", color: SEV_BORDER[sev] }}>
+            {SEV_LABEL[sev]}
+          </span>
+        </div>
       </div>
-      <div style={{ fontSize: 12, fontFamily: "monospace", color: "#cbd5e1", marginBottom: 4 }}>
+      <div style={{ fontSize:12, fontFamily:"monospace", color:"#cbd5e1", marginBottom:4 }}>
         {d.matched_text}
       </div>
-      <div style={{ display: "flex", gap: 8, fontSize: 9, color: "#475569" }}>
-        <span>{d.source === "screen" ? "🖥 Screen" : "📋 Clipboard"}</span>
-        {d.bbox && <span>📍 {Math.round(d.bbox.x)},{Math.round(d.bbox.y)}</span>}
-        <span>{age < 5 ? "just now" : `${age}s ago`}</span>
+      <div style={{ fontSize:9, color:"#475569" }}>
+        {d.source === "pdf" ? "📄 PDF" : "📋 Clipboard"}
       </div>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// CONTROL PANEL PAGE
+// Control panel
 // ---------------------------------------------------------------------------
 
+type ModelState = "idle" | "loading" | "ready" | "error";
+
 function ControlPanel() {
-  const [scanning,    setScanning]    = useState(false);
-  const [overlayOn,   setOverlayOn]   = useState(false);
-  const [detections,  setDetections]  = useState<Detection[]>([]);
-  const [status,      setStatus]      = useState("Ready — click Start Scanning");
-  const [modelInfo,   setModelInfo]   = useState<ModelInfo | null>(null);
-  const [ollamaOk,    setOllamaOk]    = useState<boolean | null>(null);
+  const [scanning,       setScanning]       = useState(false);
+  const [overlayOn,      setOverlayOn]      = useState(false);
+  const [detections,     setDetections]     = useState<Detection[]>([]);
+  const [status,         setStatus]         = useState("Ready");
+  const [modelState,     setModelState]     = useState<ModelState>("idle");
+  const [modelError,     setModelError]     = useState<string | null>(null);
+  const [currentPdf,     setCurrentPdf]     = useState<string | null>(null);
+  const [previewWaiting, setPreviewWaiting] = useState(false);
 
-  const unlistenRef   = useRef<UnlistenFn | null>(null);
-  const processedIds  = useRef<Set<string>>(new Set());
+  const unlistenRef  = useRef<UnlistenFn | null>(null);
+  const processedIds = useRef<Set<string>>(new Set());
 
-  // Load model info and probe Ollama on mount
   useEffect(() => {
-    invoke<ModelInfo>("get_model_info").then(info => {
-      setModelInfo(info);
-      // Quick connectivity check
-      fetch(`${info.ollama_url}/api/tags`, { signal: AbortSignal.timeout(3000) })
-        .then(r => setOllamaOk(r.ok))
-        .catch(() => setOllamaOk(false));
-    });
     invoke<boolean>("get_overlay_active").then(setOverlayOn);
+
+    const unsubs: Array<() => void> = [];
+
+    listen("paligemma_ready", () => {
+      setModelState("ready");
+      setStatus("Scanner ready — watching Preview");
+    }).then(u => unsubs.push(u));
+
+    listen<string>("paligemma_error", e => {
+      setModelState("error");
+      setModelError(e.payload);
+      setScanning(false);
+      setStatus("⚠ Scanner error");
+    }).then(u => unsubs.push(u));
+
+    listen<PreviewStatus>("preview_status", e => {
+      setPreviewWaiting(e.payload.status === "waiting");
+      setStatus(e.payload.message);
+      if (e.payload.status === "scanning") {
+        setCurrentPdf(e.payload.message.replace("Scanning: ", ""));
+      }
+    }).then(u => unsubs.push(u));
+
+    return () => unsubs.forEach(u => u());
   }, []);
 
   const handleScanResult = useCallback((payload: ScanResult) => {
+    if (payload.pdf_path) setCurrentPdf(payload.pdf_path.split("/").pop() ?? null);
     const fresh = payload.detections.filter(d => !processedIds.current.has(d.id));
     if (!fresh.length) return;
     fresh.forEach(d => processedIds.current.add(d.id));
-    setDetections(prev => [...fresh, ...prev].slice(0, 100));
+    setDetections(prev => [...fresh, ...prev].slice(0, 200));
+    const crits = fresh.filter(d => d.severity === "CRITICAL").length;
+    setStatus(crits > 0
+      ? `🚨 ${crits} critical finding${crits > 1 ? "s" : ""} in PDF`
+      : `Found ${fresh.length} item${fresh.length > 1 ? "s" : ""} in PDF`
+    );
   }, []);
 
   const toggleScan = useCallback(async () => {
     if (!scanning) {
       try {
+        setModelState("loading");
+        setModelError(null);
+        setStatus("Starting PDF scanner…");
         await invoke("start_scanning");
         setScanning(true);
-        setStatus(`Scanning · ${modelInfo?.model ?? "VLM"} · every 3s`);
         const ul = await listen<ScanResult>("scan_result", e => handleScanResult(e.payload));
         unlistenRef.current = ul;
-      } catch (err) { setStatus(`Error: ${err}`); }
+      } catch (err) {
+        setModelState("error");
+        setModelError(String(err));
+        setScanning(false);
+        setStatus(`Error: ${err}`);
+      }
     } else {
       await invoke("stop_scanning");
       setScanning(false);
-      setStatus("Paused");
+      setModelState("idle");
+      setStatus("Stopped");
+      setCurrentPdf(null);
+      setPreviewWaiting(false);
       unlistenRef.current?.();
       unlistenRef.current = null;
     }
-  }, [scanning, handleScanResult, modelInfo]);
+  }, [scanning, handleScanResult]);
 
   const toggleOverlay = useCallback(async () => {
     const next = !overlayOn;
     await invoke("set_overlay_visible", { visible: next });
     setOverlayOn(next);
-    setStatus(next ? "Overlay active" : "Overlay hidden");
   }, [overlayOn]);
 
   const scanClipboard = useCallback(async () => {
     try {
       const found = await invoke<Detection[]>("scan_clipboard_now");
       if (!found.length) { setStatus("Clipboard: clean ✓"); return; }
-      handleScanResult({ detections: found, raw_text_snippet: "" });
+      handleScanResult({ detections: found, raw_text_snippet: "", pdf_path: null });
       setStatus(`Clipboard: ${found.length} item(s) flagged`);
     } catch (err) { setStatus(`Clipboard error: ${err}`); }
   }, [handleScanResult]);
@@ -284,132 +277,162 @@ function ControlPanel() {
 
   return (
     <div style={{
-      width: "100vw", height: "100vh",
-      background: "#0a0f1e",
-      color: "#e2e8f0",
-      fontFamily: "'SF Pro Display', 'Segoe UI', system-ui, sans-serif",
-      display: "flex", flexDirection: "column",
-      overflow: "hidden",
+      width:"100vw", height:"100vh", background:"#0a0f1e", color:"#e2e8f0",
+      fontFamily:"'SF Pro Display','Segoe UI',system-ui,sans-serif",
+      display:"flex", flexDirection:"column", overflow:"hidden",
     }}>
       <style>{`
-        @keyframes fadeIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
-        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
-        ::-webkit-scrollbar { width:4px; }
-        ::-webkit-scrollbar-track { background:#0f172a; }
-        ::-webkit-scrollbar-thumb { background:#1e293b; border-radius:2px; }
+        @keyframes fadeIn { from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none} }
+        @keyframes pulse  { 0%,100%{opacity:1}50%{opacity:0.3} }
+        @keyframes spin   { from{transform:rotate(0deg)}to{transform:rotate(360deg)} }
+        ::-webkit-scrollbar{width:4px}
+        ::-webkit-scrollbar-track{background:#0f172a}
+        ::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
       `}</style>
 
       {/* Header */}
-      <div style={{ padding: "14px 16px 10px", borderBottom: "1px solid #1e293b", background: "#070d1a" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <div style={{ padding:"14px 16px 10px", borderBottom:"1px solid #1e293b", background:"#070d1a" }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
             <div style={{
-              width: 30, height: 30,
-              background: "linear-gradient(135deg, #1d4ed8, #7c3aed)",
-              borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 15, boxShadow: "0 0 12px #7c3aed55",
-            }}>
-              🛡
-            </div>
+              width:30, height:30,
+              background:"linear-gradient(135deg,#1d4ed8,#7c3aed)",
+              borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center",
+              fontSize:15, boxShadow:"0 0 12px #7c3aed55",
+            }}>🛡</div>
             <div>
-              <div style={{ fontSize: 13, fontWeight: 800, letterSpacing: "0.12em", color: "#f8fafc", fontFamily: "monospace" }}>
+              <div style={{ fontSize:13, fontWeight:800, letterSpacing:"0.12em", color:"#f8fafc", fontFamily:"monospace" }}>
                 AXIOM
               </div>
-              <div style={{ fontSize: 8, color: "#475569", letterSpacing: "0.1em" }}>
-                DATA LEAKAGE PREVENTION · VLM EDITION
+              <div style={{ fontSize:8, color:"#475569", letterSpacing:"0.1em" }}>
+                PDF DATA LEAKAGE PREVENTION
               </div>
             </div>
           </div>
-          <div style={{ display: "flex", gap: 4 }}>
+          <div style={{ display:"flex", gap:4 }}>
             {critical > 0 && (
-              <span style={{ background: "#dc2626", color: "#fff", fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 99, animation: "pulse 2s infinite" }}>
+              <span style={{ background:"#dc2626", color:"#fff", fontSize:9, fontWeight:700, padding:"2px 7px", borderRadius:99, animation:"pulse 2s infinite" }}>
                 {critical} CRIT
               </span>
             )}
             {high > 0 && (
-              <span style={{ background: "#ea580c", color: "#fff", fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 99 }}>
+              <span style={{ background:"#ea580c", color:"#fff", fontSize:9, fontWeight:700, padding:"2px 7px", borderRadius:99 }}>
                 {high} HIGH
               </span>
             )}
           </div>
         </div>
 
-        {/* Status strip */}
+        {/* Status bar */}
         <div style={{
-          marginTop: 8, padding: "5px 8px",
-          background: "#0f172a", borderRadius: 5,
-          fontSize: 10, color: "#64748b",
-          display: "flex", alignItems: "center", gap: 6,
+          marginTop:8, padding:"5px 8px", background:"#0f172a", borderRadius:5,
+          fontSize:10, color:"#64748b", display:"flex", alignItems:"center", gap:6,
         }}>
           <span style={{
-            width: 7, height: 7, borderRadius: "50%",
-            background: scanning ? "#22c55e" : "#334155",
-            display: "inline-block",
+            width:7, height:7, borderRadius:"50%",
+            background: scanning ? (previewWaiting ? "#f97316" : "#22c55e") : "#334155",
+            display:"inline-block",
             boxShadow: scanning ? "0 0 6px #22c55e" : "none",
             animation: scanning ? "pulse 1.5s infinite" : "none",
-          }} />
+          }}/>
           {status}
         </div>
       </div>
 
-      {/* Model info badge */}
-      {modelInfo && (
+      {/* Current PDF indicator */}
+      {currentPdf && (
         <div style={{
-          margin: "8px 14px 0",
-          padding: "6px 10px",
-          background: "#0f172a",
-          border: `1px solid ${ollamaOk === false ? "#7f1d1d" : ollamaOk ? "#14532d" : "#1e293b"}`,
-          borderRadius: 6,
-          display: "flex", alignItems: "center", gap: 8, fontSize: 10,
+          margin:"8px 14px 0", padding:"8px 10px",
+          background:"#0f172a", border:"1px solid #1e3a5f",
+          borderRadius:6, display:"flex", alignItems:"center", gap:8,
         }}>
-          <span style={{ fontSize: 14 }}>{ollamaOk === false ? "⚠️" : ollamaOk ? "🤖" : "⏳"}</span>
-          <div style={{ flex: 1 }}>
-            <div style={{ color: "#94a3b8", fontFamily: "monospace" }}>
-              <strong style={{ color: "#c084fc" }}>{modelInfo.model}</strong>
-              {" · "}
-              <span style={{ color: "#64748b" }}>{modelInfo.ollama_url}</span>
-            </div>
-            <div style={{ color: ollamaOk === false ? "#ef4444" : ollamaOk ? "#4ade80" : "#64748b", fontSize: 9, marginTop: 1 }}>
-              {ollamaOk === null ? "Checking Ollama…" : ollamaOk ? "Ollama reachable · VLM ready" : "Ollama not found — run: ollama serve"}
+          <span style={{ fontSize:16 }}>📄</span>
+          <div style={{ flex:1, minWidth:0 }}>
+            <div style={{ fontSize:9, color:"#475569", marginBottom:2 }}>SCANNING IN PREVIEW</div>
+            <div style={{ fontSize:11, color:"#93c5fd", fontFamily:"monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+              {currentPdf}
             </div>
           </div>
         </div>
       )}
 
+      {/* Waiting for Preview indicator */}
+      {scanning && previewWaiting && !currentPdf && (
+        <div style={{
+          margin:"8px 14px 0", padding:"12px",
+          background:"#0f172a", border:"1px solid #1e293b",
+          borderRadius:6, textAlign:"center",
+        }}>
+          <div style={{ fontSize:24, marginBottom:6 }}>📂</div>
+          <div style={{ fontSize:11, color:"#64748b" }}>
+            Open a PDF in Preview to begin scanning
+          </div>
+        </div>
+      )}
+
+      {/* Scanner state badge */}
+      <div style={{
+        margin:"8px 14px 0", padding:"8px 10px",
+        background:"#0f172a",
+        border:`1px solid ${modelState === "ready" ? "#14532d" : modelState === "error" ? "#7f1d1d" : modelState === "loading" ? "#1e3a5f" : "#1e293b"}`,
+        borderRadius:6,
+      }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <span style={{ fontSize:14 }}>
+            {modelState === "ready" ? "🔍" : modelState === "error" ? "⚠️" : modelState === "loading" ? "⏳" : "⏸"}
+          </span>
+          <div>
+            <div style={{ fontSize:10, color:"#94a3b8", fontFamily:"monospace" }}>
+              <strong style={{ color:"#a78bfa" }}>PDF Scanner · pdfminer.six</strong>
+            </div>
+            <div style={{ fontSize:9, marginTop:1,
+              color: modelState==="ready" ? "#4ade80" : modelState==="error" ? "#ef4444" : modelState==="loading" ? "#60a5fa" : "#64748b"
+            }}>
+              {modelState === "idle" ? "Click Start to watch Preview"
+               : modelState === "loading" ? "Starting scanner…"
+               : modelState === "ready" ? "Watching Preview · regex PII scan"
+               : modelError?.split("\n")[0] ?? "Error"}
+            </div>
+          </div>
+        </div>
+        {modelState === "error" && modelError && (
+          <div style={{ marginTop:6, fontFamily:"monospace", fontSize:9, color:"#f87171",
+            background:"#1e0f0f", padding:"5px 8px", borderRadius:4, whiteSpace:"pre-wrap" }}>
+            {modelError}
+          </div>
+        )}
+      </div>
+
       {/* Controls */}
-      <div style={{ padding: "10px 14px", borderBottom: "1px solid #1e293b", display: "flex", flexDirection: "column", gap: 7, marginTop: 4 }}>
+      <div style={{ padding:"10px 14px", borderBottom:"1px solid #1e293b", display:"flex", flexDirection:"column", gap:7, marginTop:8 }}>
         <button
           onClick={toggleScan}
-          disabled={ollamaOk === false}
+          disabled={modelState === "loading"}
           style={{
-            width: "100%", padding: "9px 0",
-            fontSize: 12, fontWeight: 700,
-            borderRadius: 6, border: "none",
-            background: ollamaOk === false ? "#1e293b" : scanning ? "#991b1b" : "#065f46",
-            color: ollamaOk === false ? "#475569" : "#fff",
-            cursor: ollamaOk === false ? "not-allowed" : "pointer",
-            letterSpacing: "0.04em",
-            transition: "background 0.2s",
+            width:"100%", padding:"9px 0", fontSize:12, fontWeight:700,
+            borderRadius:6, border:"none",
+            background: modelState==="loading" ? "#1e3a5f" : scanning ? "#991b1b" : "#065f46",
+            color:"#fff",
+            cursor: modelState==="loading" ? "wait" : "pointer",
+            letterSpacing:"0.04em",
           }}
         >
-          {scanning ? "⏹  Stop Scanning" : "▶  Start Scanning"}
+          {modelState === "loading" ? "⏳ Starting…"
+           : scanning ? "⏹  Stop Watching"
+           : "▶  Watch Preview"}
         </button>
 
-        <div style={{ display: "flex", gap: 7 }}>
+        <div style={{ display:"flex", gap:7 }}>
           <button onClick={scanClipboard} style={{
-            flex: 1, padding: "7px 0", fontSize: 11, fontWeight: 600,
-            borderRadius: 6, border: "none",
-            background: "#1e293b", color: "#94a3b8", cursor: "pointer",
-          }}>
-            📋 Scan Clipboard
-          </button>
+            flex:1, padding:"7px 0", fontSize:11, fontWeight:600,
+            borderRadius:6, border:"none", background:"#1e293b", color:"#94a3b8", cursor:"pointer",
+          }}>📋 Scan Clipboard</button>
           <button onClick={toggleOverlay} style={{
-            flex: 1, padding: "7px 0", fontSize: 11, fontWeight: 600,
-            borderRadius: 6, border: "none",
+            flex:1, padding:"7px 0", fontSize:11, fontWeight:600,
+            borderRadius:6, border:"none",
             background: overlayOn ? "#451a03" : "#1e293b",
             color: overlayOn ? "#fcd34d" : "#94a3b8",
-            cursor: "pointer",
-            transition: "background 0.2s",
+            cursor:"pointer",
           }}>
             {overlayOn ? "🔲 Hide Overlay" : "🔳 Show Overlay"}
           </button>
@@ -417,8 +440,8 @@ function ControlPanel() {
 
         {detections.length > 0 && (
           <button
-            onClick={() => { setDetections([]); processedIds.current.clear(); }}
-            style={{ fontSize: 9, color: "#334155", background: "none", border: "none", cursor: "pointer", padding: "1px 0" }}
+            onClick={() => { setDetections([]); processedIds.current.clear(); setStatus("Cleared"); }}
+            style={{ fontSize:9, color:"#334155", background:"none", border:"none", cursor:"pointer", padding:"1px 0" }}
           >
             Clear {detections.length} result(s)
           </button>
@@ -426,13 +449,13 @@ function ControlPanel() {
       </div>
 
       {/* Detection list */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "10px 14px" }}>
+      <div style={{ flex:1, overflowY:"auto", padding:"10px 14px" }}>
         {detections.length === 0 ? (
-          <div style={{ textAlign: "center", padding: "40px 20px", color: "#1e293b" }}>
-            <div style={{ fontSize: 36, marginBottom: 10, opacity: 0.4 }}>🔍</div>
-            <p style={{ fontSize: 11, lineHeight: 1.7, color: "#334155" }}>
-              No sensitive data detected.
-              <br />Start scanning to monitor your screen with {modelInfo?.model ?? "the VLM"}.
+          <div style={{ textAlign:"center", padding:"40px 20px" }}>
+            <div style={{ fontSize:36, marginBottom:10, opacity:0.3 }}>📄</div>
+            <p style={{ fontSize:11, lineHeight:1.7, color:"#334155" }}>
+              No sensitive data detected yet.<br/>
+              Open a PDF in Preview and click Watch.
             </p>
           </div>
         ) : detections.map(d => <DetectionCard key={d.id} d={d} />)}
@@ -440,12 +463,10 @@ function ControlPanel() {
 
       {/* Footer */}
       <div style={{
-        padding: "7px 14px",
-        borderTop: "1px solid #0f172a",
-        fontSize: 8, color: "#1e293b",
-        textAlign: "center", letterSpacing: "0.06em",
+        padding:"7px 14px", borderTop:"1px solid #0f172a",
+        fontSize:8, color:"#1e293b", textAlign:"center", letterSpacing:"0.06em",
       }}>
-        100% LOCAL · NO DATA LEAVES THIS DEVICE · OLLAMA + {modelInfo?.model?.toUpperCase() ?? "VLM"}
+        100% LOCAL · NO SCREEN RECORDING · NO DATA LEAVES THIS DEVICE
       </div>
     </div>
   );
