@@ -1,14 +1,5 @@
 // src-tauri/src/lib.rs
 // Axiom — Preview PDF Data Leakage Prevention
-//
-// Pipeline (no screen recording required):
-//   1. AppleScript asks Preview for the path of its front document
-//   2. Python reads the PDF with pdfminer and extracts all text
-//   3. Regex patterns scan the text for PII
-//   4. Detections are emitted to the side panel
-//   5. Overlay window shows a badge over the Preview app window
-//
-// No PaliGemma, no camera, no screen recording permission needed.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -17,7 +8,7 @@ use std::time::Duration;
 use std::thread;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,11 +31,8 @@ pub struct Detection {
     pub source: DetectionSource,
     pub page: Option<u32>,
     pub timestamp_ms: u64,
-    /// Which detection layer(s) caught this: "regex", "gemma", or "regex+gemma"
     pub detection_layer: String,
-    /// Gemma confidence: "high" | "medium" | "low"
     pub confidence: String,
-    /// Raw matched value — used by the redactor, not shown in UI
     pub raw_value: String,
 }
 
@@ -54,12 +42,10 @@ pub struct ScanResult {
     pub raw_text_snippet: String,
     pub pdf_path:     Option<String>,
     pub gemma_log:    Vec<GemmaPageLog>,
-    /// Model info from init handshake
     pub model_id:     Option<String>,
     pub device:       Option<String>,
 }
 
-/// One detection returned by the Python subprocess.
 #[derive(Debug, Deserialize)]
 struct PyDetection {
     label:    String,
@@ -75,7 +61,6 @@ struct PyDetection {
     confidence: String,
 }
 
-/// Per-page Gemma activity log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GemmaPageLog {
     pub page:         u32,
@@ -83,10 +68,9 @@ pub struct GemmaPageLog {
     pub raw_findings: u32,
     pub kept:         u32,
     pub duration_ms:  u32,
-    pub status:       String,  // "ok" | "empty" | "parse_error" | "blank"
+    pub status:       String,
 }
 
-/// Response envelope from the Python subprocess.
 #[derive(Debug, Deserialize)]
 struct PyResponse {
     id:         String,
@@ -112,7 +96,6 @@ pub struct PdfScanProcess {
 
 pub struct AppState {
     pub scanning:        Arc<Mutex<bool>>,
-    pub overlay_active:  Arc<Mutex<bool>>,
     pub py_process:      Arc<Mutex<Option<PdfScanProcess>>>,
     pub redact_process:  Arc<Mutex<Option<PdfScanProcess>>>,
     pub model_ready:     Arc<Mutex<bool>>,
@@ -121,15 +104,14 @@ pub struct AppState {
     pub last_detections: Arc<Mutex<Vec<serde_json::Value>>>,
     pub model_id:        Arc<Mutex<Option<String>>>,
     pub device:          Arc<Mutex<Option<String>>>,
+    pub scanned_paths:   Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        let script = std::env::var("AXIOM_PY_SCRIPT")
-            .unwrap_or_else(|_| "scripts/pdf_scanner.py".to_string());
+        let script = std::env::var("AXIOM_PY_SCRIPT").unwrap_or_else(|_| "scripts/pdf_scanner.py".to_string());
         AppState {
             scanning:        Arc::new(Mutex::new(false)),
-            overlay_active:  Arc::new(Mutex::new(false)),
             py_process:      Arc::new(Mutex::new(None)),
             redact_process:  Arc::new(Mutex::new(None)),
             model_ready:     Arc::new(Mutex::new(false)),
@@ -138,6 +120,7 @@ impl Default for AppState {
             last_detections: Arc::new(Mutex::new(Vec::new())),
             model_id:        Arc::new(Mutex::new(None)),
             device:          Arc::new(Mutex::new(None)),
+            scanned_paths:   Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -146,11 +129,41 @@ impl Default for AppState {
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn init_shared_db() -> rusqlite::Result<rusqlite::Connection> {
+    let db_path = std::env::temp_dir().join("axiom_shared.db");
+    let conn = rusqlite::Connection::open(db_path)?;
+    
+    // Activity Log Table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS activity_log (
+            id TEXT PRIMARY KEY, employee_name TEXT, department TEXT, file_name TEXT,
+            detection_count INTEGER, highest_severity TEXT, timestamp INTEGER, redacted BOOLEAN, pii_types TEXT
+        )", [],
+    )?;
+
+    // Employees Table (NEW)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS employees (
+            id TEXT PRIMARY KEY, name TEXT, username TEXT UNIQUE, password TEXT,
+            department TEXT, status TEXT, last_seen INTEGER, total_scans INTEGER,
+            total_detections INTEGER, risk_score INTEGER, avatar_initials TEXT
+        )", [],
+    )?;
+
+    // Create a default admin user if the table is empty
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM employees", [], |row| row.get(0))?;
+    if count == 0 {
+        let _ = conn.execute(
+            "INSERT INTO employees (id, name, username, password, department, status, last_seen, total_scans, total_detections, risk_score, avatar_initials)
+             VALUES ('e_admin', 'Admin User', 'admin', 'password', 'IT', 'active', 0, 0, 0, 0, 'AD')", []
+        );
+    }
+    
+    Ok(conn)
+}
+
 fn timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 fn severity_from_str(s: &str) -> Severity {
@@ -162,8 +175,6 @@ fn severity_from_str(s: &str) -> Severity {
     }
 }
 
-/// Ask open apps for the frontmost document path via AppleScript.
-/// Returns a POSIX path string, or None if nothing supported is open.
 fn get_preview_pdf_path() -> Option<String> {
     const EXTS: &[&str] = &[".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"];
 
@@ -174,18 +185,20 @@ fn get_preview_pdf_path() -> Option<String> {
         set posixPath to ""
 
         try
+            if application "Numbers" is running then
+                set posixPath to run script "tell application \"Numbers\" to get path of front document"
+                if posixPath is not "" then return posixPath
+            end if
+        end try
+
+        try
             if application "Preview" is running then
                 set posixPath to run script "tell application \"Preview\" to get path of front document"
                 if posixPath is not "" then return posixPath
             end if
         end try
 
-        try
-            if application "Microsoft Word" is running then
-                set posixPath to run script "tell application \"Microsoft Word\" to get full name of active document"
-                if posixPath is not "" then return posixPath
-            end if
-        end try
+        
 
         try
             if application "Microsoft Excel" is running then
@@ -306,63 +319,36 @@ fn scan_clipboard_for_pii(text: &str) -> Vec<Detection> {
 // Python subprocess management
 // ---------------------------------------------------------------------------
 
-fn find_python() -> String {
-    // We are no longer looking for venv folders. 
-    // This relies on your global system path.
-    "python3".to_string()
-}
+fn find_python() -> String { "python3".to_string() }
 
 fn spawn_pdf_scanner(script_path: &str) -> anyhow::Result<(PdfScanProcess, Option<String>, Option<String>)> {
     let python = find_python();
-    
-    // Resolve the absolute path to the script to avoid CWD issues
     let mut base_path = std::env::current_dir().unwrap_or_default();
-    
-    // If the app started inside src-tauri, go up one level to find /scripts
-    if base_path.ends_with("src-tauri") {
-        base_path.pop();
-    }
-    
-    let absolute_script_path = base_path.join("scripts/pdf_scanner.py");
-    
-    eprintln!("[Axiom] Spawning: {} {:?}", python, absolute_script_path);
+    if base_path.ends_with("src-tauri") { base_path.pop(); }
+    let absolute_script_path = base_path.join(script_path);
 
     let mut child = Command::new(&python)
         .arg(absolute_script_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // Keeps Python errors visible in your terminal
+        .stderr(Stdio::inherit())
         .spawn()?;
 
-    let stdin = child.stdin.take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to open subprocess stdin"))?;
-    let stdout_raw = child.stdout.take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to open subprocess stdout"))?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout_raw = child.stdout.take().unwrap();
     let mut stdout = BufReader::new(stdout_raw);
 
-    // Wait for ready signal
     let mut line = String::new();
     loop {
         line.clear();
         let n = stdout.read_line(&mut line)?;
-        if n == 0 { 
-            let status = child.try_wait()?;
-            anyhow::bail!("Subprocess exited immediately with status: {:?}", status); 
-        }
+        if n == 0 { anyhow::bail!("Subprocess exited immediately"); }
         let t = line.trim();
         if t.is_empty() { continue; }
-        let resp: PyResponse = serde_json::from_str(t)
-            .map_err(|e| anyhow::anyhow!("Bad init JSON: {e} — raw: {t}"))?;
-        if let Some(err) = resp.error {
-            anyhow::bail!("Subprocess init error: {err}");
-        }
-        if resp.ready {
-            let model = resp.model.clone();
-            let device = resp.device.clone();
-            return Ok((PdfScanProcess { child, stdin, stdout }, model, device));
-        }
+        let resp: PyResponse = serde_json::from_str(t)?;
+        if let Some(err) = resp.error { anyhow::bail!("Subprocess init error: {err}"); }
+        if resp.ready { return Ok((PdfScanProcess { child, stdin, stdout }, resp.model, resp.device)); }
     }
-    anyhow::bail!("Subprocess never sent ready signal")
 }
 
 fn spawn_redactor() -> anyhow::Result<PdfScanProcess> {
@@ -371,8 +357,6 @@ fn spawn_redactor() -> anyhow::Result<PdfScanProcess> {
     if base_path.ends_with("src-tauri") { base_path.pop(); }
     let script = base_path.join("scripts/redact_document.py");
 
-    eprintln!("[Axiom] Spawning redactor: {} {:?}", python, script);
-
     let mut child = Command::new(&python)
         .arg(script)
         .stdin(Stdio::piped())
@@ -380,23 +364,18 @@ fn spawn_redactor() -> anyhow::Result<PdfScanProcess> {
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    let stdin      = child.stdin.take().ok_or_else(|| anyhow::anyhow!("redactor stdin"))?;
-    let stdout_raw = child.stdout.take().ok_or_else(|| anyhow::anyhow!("redactor stdout"))?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout_raw = child.stdout.take().unwrap();
     let mut stdout = BufReader::new(stdout_raw);
 
-    // Wait for ready signal
     let mut line = String::new();
     loop {
         line.clear();
         let n = stdout.read_line(&mut line)?;
-        if n == 0 {
-            let status = child.try_wait()?;
-            anyhow::bail!("Redactor exited immediately: {:?}", status);
-        }
+        if n == 0 { anyhow::bail!("Redactor exited immediately"); }
         let t = line.trim();
         if t.is_empty() { continue; }
-        let resp: serde_json::Value = serde_json::from_str(t)
-            .map_err(|e| anyhow::anyhow!("Bad redactor init JSON: {e} raw: {t}"))?;
+        let resp: serde_json::Value = serde_json::from_str(t)?;
         if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
             if !err.is_empty() { anyhow::bail!("Redactor init error: {err}"); }
         }
@@ -420,8 +399,7 @@ fn query_subprocess(proc: &mut PdfScanProcess, req_id: &str, pdf_path: &str) -> 
         if n == 0 { anyhow::bail!("Subprocess closed stdout unexpectedly"); }
         let t = resp_line.trim();
         if t.is_empty() { continue; }
-        let resp: PyResponse = serde_json::from_str(t)
-            .map_err(|e| anyhow::anyhow!("Bad response JSON: {e} — raw: {t}"))?;
+        let resp: PyResponse = serde_json::from_str(t)?;
         if let Some(err) = resp.error { anyhow::bail!("Subprocess error: {err}"); }
         return Ok(resp);
     }
@@ -431,59 +409,45 @@ fn py_to_detections(items: Vec<PyDetection>) -> Vec<Detection> {
     let ts = timestamp_ms();
     items.into_iter().enumerate().map(|(i, item)| Detection {
         id: format!("{}-{}-{}", item.label, i, ts),
-        pattern_name: item.label,
+        pattern_name: item.label.clone(),
         matched_text: item.redacted,
         severity: severity_from_str(&item.severity),
         source: DetectionSource::Pdf,
         page: if item.page > 0 { Some(item.page) } else { None },
         timestamp_ms: ts,
-        detection_layer: if item.detection_layer.is_empty() {
-            "gemma".to_string()
-        } else {
-            item.detection_layer.clone()
-        },
-        confidence: if item.confidence.is_empty() {
-            "medium".to_string()
-        } else {
-            item.confidence.clone()
-        },
-        raw_value: item.raw_value.clone(),
+        detection_layer: if item.detection_layer.is_empty() { "gemma".to_string() } else { item.detection_layer },
+        confidence: if item.confidence.is_empty() { "medium".to_string() } else { item.confidence },
+        raw_value: item.raw_value,
     }).collect()
 }
-
-// ---------------------------------------------------------------------------
-// Overlay window
-// ---------------------------------------------------------------------------
-
-fn get_or_create_overlay(app: &AppHandle) -> anyhow::Result<tauri::WebviewWindow> {
-    if let Some(w) = app.get_webview_window("overlay") { return Ok(w); }
-
-    let (sw, sh) = app.primary_monitor().ok().flatten()
-        .map(|m| { let s = m.size(); (s.width, s.height) })
-        .unwrap_or((1920, 1080));
-
-    let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("/overlay".into()))
-        .title("Axiom Overlay")
-        .transparent(true).decorations(false).always_on_top(true)
-        .skip_taskbar(true).resizable(false)
-        .inner_size(sw as f64, sh as f64).position(0.0, 0.0).focused(false)
-        .build()?;
-
-    overlay.set_ignore_cursor_events(true)?;
-    Ok(overlay)
-}
-
-// ---------------------------------------------------------------------------
-// Tauri commands
-// ---------------------------------------------------------------------------
 
 mod commands {
     use super::*;
 
     #[tauri::command]
+    pub fn login(username: String, pass: String) -> Result<serde_json::Value, String> {
+        let conn = init_shared_db().map_err(|e| e.to_string())?;
+        
+        let mut stmt = conn.prepare("SELECT id, name, department FROM employees WHERE username = ?1 AND password = ?2 AND status = 'active'").unwrap();
+        let mut rows = stmt.query(rusqlite::params![username, pass]).unwrap();
+        
+        if let Some(row) = rows.next().unwrap() {
+            let id: String = row.get(0).unwrap();
+            let name: String = row.get(1).unwrap();
+            let dept: String = row.get(2).unwrap();
+            Ok(serde_json::json!({ "id": id, "name": name, "department": dept }))
+        } else {
+            Err("Invalid credentials or account suspended.".into())
+        }
+    }
+
+    #[tauri::command]
     pub async fn start_scanning(
-        app: AppHandle,
+        app: AppHandle, 
         state: State<'_, AppState>,
+        emp_id: String,
+        emp_name: String,
+        emp_dept: String
     ) -> Result<(), String> {
         {
             let mut s = state.scanning.lock().map_err(|e| e.to_string())?;
@@ -491,71 +455,65 @@ mod commands {
             *s = true;
         }
 
-        get_or_create_overlay(&app).map_err(|e| e.to_string())?;
+        let flag              = Arc::clone(&state.scanning);
+        let py_proc_arc       = Arc::clone(&state.py_process);
+        let ready_arc         = Arc::clone(&state.model_ready);
+        let pdf_path_arc      = Arc::clone(&state.last_pdf_path);
+        let dets_arc          = Arc::clone(&state.last_detections);
+        let model_id_arc      = Arc::clone(&state.model_id);
+        let device_arc        = Arc::clone(&state.device);
+        let scanned_paths_arc = Arc::clone(&state.scanned_paths);
+        let handle            = app.clone();
 
-        let flag         = Arc::clone(&state.scanning);
-        let py_proc_arc  = Arc::clone(&state.py_process);
-        let ready_arc    = Arc::clone(&state.model_ready);
-        let pdf_path_arc  = Arc::clone(&state.last_pdf_path);
-        let detections_arc = Arc::clone(&state.last_detections);
-        let model_id_arc  = Arc::clone(&state.model_id);
-        let device_arc    = Arc::clone(&state.device);
-        let handle       = app.clone();
-        let script_path  = state.script_path.clone();
-
-        // Inside start_scanning in lib.rs
         thread::spawn(move || {
-        // We pass a dummy string because spawn_pdf_scanner 
-        // now calculates the absolute path internally
-        let (proc, gemma_model_id, gemma_device) = match spawn_pdf_scanner("scripts/pdf_scanner.py") {
-            Ok(t) => t,
-            Err(e) => {
-                let msg = format!("Scanner failed to start: {e}");
-                eprintln!("[Axiom] {msg}");
-                let _ = handle.emit_to("main", "paligemma_error", &msg);
-                if let Ok(mut s) = flag.lock() { *s = false; }
-                return;
-            }
-        };
+            let (proc, gemma_model_id, gemma_device) = match spawn_pdf_scanner("scripts/pdf_scanner.py") {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = handle.emit_to("main", "paligemma_error", e.to_string());
+                    if let Ok(mut s) = flag.lock() { *s = false; }
+                    return;
+                }
+            };
 
             if let Ok(mut g) = py_proc_arc.lock() { *g = Some(proc); }
             if let Ok(mut r) = ready_arc.lock()   { *r = true; }
-            if let Ok(mut m) = model_id_arc.lock() { *m = gemma_model_id.clone(); }
-            if let Ok(mut d) = device_arc.lock()   { *d = gemma_device.clone(); }
+            if let Ok(mut m) = model_id_arc.lock() { *m = gemma_model_id; }
+            if let Ok(mut d) = device_arc.lock()   { *d = gemma_device; }
 
-            // The init response is already consumed in spawn_pdf_scanner.
-            // We re-read model/device from a separate init_info if available.
-            // (spawn_pdf_scanner returns PdfScanProcess after ready signal;
-            //  model metadata is emitted via paligemma_ready payload below)
-            let _ = handle.emit_to("main", "paligemma_ready", ());
+            let model_id_val = model_id_arc.lock().ok().and_then(|g| g.clone());
+            let device_val   = device_arc.lock().ok().and_then(|g| g.clone());
+            let _ = handle.emit_to("main", "paligemma_ready", serde_json::json!({
+                "model_id": model_id_val,
+                "device":   device_val,
+            }));
 
             let mut req_counter: u64 = 0;
             let mut last_scanned_path: Option<String> = None;
 
             while *flag.lock().unwrap() {
-                // Ask Preview which PDF it has open
-                let pdf_path = match get_preview_pdf_path() {
-                    Some(p) => p,
-                    None => {
-                        eprintln!("[Axiom] No supported document open — waiting…");
-                        let _ = handle.emit_to("main", "preview_status",
-                            serde_json::json!({"status": "waiting", "message": "Open a PDF, DOCX, XLSX, or PPTX to begin scanning"}));
+                let pdf_path = get_preview_pdf_path().unwrap_or_default();
+                if pdf_path.is_empty() || pdf_path.contains("_redacted") {
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+
+                // Deduplication check
+                {
+                    let mut cache = scanned_paths_arc.lock().unwrap(); 
+                    if cache.contains(&pdf_path) {
                         thread::sleep(Duration::from_secs(3));
                         continue;
                     }
-                };
+                    cache.insert(pdf_path.clone());
+                }
 
-                // Only re-scan if the file changed
                 if Some(&pdf_path) == last_scanned_path.as_ref() {
                     thread::sleep(Duration::from_secs(3));
                     continue;
                 }
 
-                eprintln!("[Axiom] Scanning PDF: {pdf_path}");
-                let _ = handle.emit_to("main", "preview_status",
-                    serde_json::json!({"status": "scanning", "message": format!("Scanning: {}", pdf_path.split('/').last().unwrap_or(&pdf_path))}));
+                let _ = handle.emit_to("main", "preview_status", serde_json::json!({"status": "scanning", "message": format!("Scanning: {}", pdf_path.split('/').last().unwrap_or(&pdf_path))}));
 
-                // Store path
                 if let Ok(mut p) = pdf_path_arc.lock() { *p = Some(pdf_path.clone()); }
 
                 req_counter += 1;
@@ -567,7 +525,6 @@ mod commands {
                         Some(proc) => match query_subprocess(proc, &req_id, &pdf_path) {
                             Ok(r) => (r.detections, r.gemma_log),
                             Err(e) => {
-                                eprintln!("[Axiom] Scan failed: {e}");
                                 let _ = handle.emit_to("main", "paligemma_error", e.to_string());
                                 (Vec::new(), Vec::new())
                             }
@@ -579,8 +536,7 @@ mod commands {
                 last_scanned_path = Some(pdf_path.clone());
                 let mut all_det = py_to_detections(py_dets);
 
-                // Persist raw detections for the redactor
-                if let Ok(mut d) = detections_arc.lock() {
+                if let Ok(mut d) = dets_arc.lock() {
                     *d = all_det.iter().map(|det| serde_json::json!({
                         "label":     det.pattern_name,
                         "severity":  format!("{:?}", det.severity),
@@ -589,34 +545,62 @@ mod commands {
                     })).collect();
                 }
 
-                // Also scan clipboard
                 if let Ok(cb) = get_clipboard_text() {
                     all_det.append(&mut scan_clipboard_for_pii(&cb));
                 }
 
-                let snippet = all_det.iter()
-                    .map(|d| format!("[{}] {}", d.pattern_name, d.matched_text))
-                    .collect::<Vec<_>>().join(", ");
-
-                let model_id_val = model_id_arc.lock().ok().and_then(|g| g.clone());
-                let device_val   = device_arc.lock().ok().and_then(|g| g.clone());
-
+                let snippet = all_det.iter().map(|d| format!("[{}] {}", d.pattern_name, d.matched_text)).collect::<Vec<_>>().join(", ");
                 let payload = ScanResult {
-                    detections: all_det,
+                    detections: all_det.clone(),
                     raw_text_snippet: snippet,
-                    pdf_path: Some(pdf_path),
+                    pdf_path: Some(pdf_path.clone()),
                     gemma_log,
-                    model_id: model_id_val,
-                    device:   device_val,
+                    model_id: model_id_arc.lock().ok().and_then(|g| g.clone()),
+                    device:   device_arc.lock().ok().and_then(|g| g.clone()),
                 };
 
-                let _ = handle.emit_to("main",    "scan_result", &payload);
-                let _ = handle.emit_to("overlay", "scan_result", &payload);
+                let _ = handle.emit_to("main", "scan_result", &payload);
+
+                // --- Write the scan result to the shared SQL database ---
+                if !all_det.is_empty() {
+                    if let Ok(conn) = init_shared_db() {
+                        let highest_sev = all_det.iter()
+                            .map(|d| d.severity.clone())
+                            .max_by_key(|s| match s {
+                                Severity::Critical => 3,
+                                Severity::High => 2,
+                                Severity::Medium => 1,
+                                _ => 0,
+                            }).unwrap_or(Severity::Low);
+
+                        let pii_types: Vec<String> = all_det.iter().map(|d| d.pattern_name.clone()).collect();
+                        let unique_pii: std::collections::HashSet<_> = pii_types.into_iter().collect();
+                        let pii_string = unique_pii.into_iter().collect::<Vec<_>>().join(";");
+                        
+                        let file_name = pdf_path.split('/').last().unwrap_or(&pdf_path);
+                        
+                        let _ = conn.execute(
+                            "INSERT INTO activity_log (id, employee_name, department, file_name, detection_count, highest_severity, timestamp, redacted, pii_types) 
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            rusqlite::params![
+                                req_id,
+                                emp_name.clone(), 
+                                emp_dept.clone(), 
+                                file_name,
+                                all_det.len() as u32,
+                                format!("{:?}", highest_sev).to_uppercase(),
+                                timestamp_ms(),
+                                false, 
+                                pii_string
+                            ],
+                        );
+                    }
+                }
+                // -------------------------------------------------------------
 
                 thread::sleep(Duration::from_secs(3));
             }
 
-            let _ = handle.emit_to("overlay", "clear_overlay", ());
         });
 
         Ok(())
@@ -629,7 +613,6 @@ mod commands {
             if let Some(mut proc) = guard.take() {
                 let _ = proc.child.kill();
                 let _ = proc.child.wait();
-                eprintln!("[Axiom] PDF scanner subprocess stopped");
             }
         }
         *state.model_ready.lock().map_err(|e| e.to_string())? = false;
@@ -637,21 +620,46 @@ mod commands {
     }
 
     #[tauri::command]
-    pub async fn set_overlay_visible(
-        app: AppHandle, state: State<'_, AppState>, visible: bool,
-    ) -> Result<(), String> {
-        *state.overlay_active.lock().map_err(|e| e.to_string())? = visible;
-        if visible {
-            get_or_create_overlay(&app).map_err(|e| e.to_string())?.show().map_err(|e| e.to_string())?;
-        } else if let Some(w) = app.get_webview_window("overlay") {
-            w.hide().map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
+    pub async fn scan_manual_file(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<(), String> {
+        let req_id = format!("manual-{}", timestamp_ms());
+        
+        let (py_dets, gemma_log) = {
+            let mut guard = state.py_process.lock().map_err(|e| e.to_string())?;
+            let proc = guard.as_mut().ok_or("Pipeline not running. Click 'Watch Active App' first.")?;
+            match query_subprocess(proc, &req_id, &path) {
+                Ok(r) => (r.detections, r.gemma_log),
+                Err(e) => return Err(e.to_string()),
+            }
+        };
 
-    #[tauri::command]
-    pub async fn get_overlay_active(state: State<'_, AppState>) -> Result<bool, String> {
-        Ok(*state.overlay_active.lock().map_err(|e| e.to_string())?)
+        let all_det = py_to_detections(py_dets);
+        
+        if let Ok(mut d) = state.last_detections.lock() {
+            *d = all_det.iter().map(|det| serde_json::json!({
+                "label":     det.pattern_name,
+                "severity":  format!("{:?}", det.severity),
+                "raw_value": det.raw_value,
+                "page":      det.page.unwrap_or(1),
+            })).collect();
+        }
+
+        if let Ok(mut p) = state.last_pdf_path.lock() { *p = Some(path.clone()); }
+
+        let snippet = all_det.iter().map(|d| format!("[{}] {}", d.pattern_name, d.matched_text)).collect::<Vec<_>>().join(", ");
+        let payload = ScanResult {
+            detections: all_det,
+            raw_text_snippet: snippet,
+            pdf_path: Some(path.clone()),
+            gemma_log,
+            model_id: state.model_id.lock().ok().and_then(|g| g.clone()),
+            device:   state.device.lock().ok().and_then(|g| g.clone()),
+        };
+
+        let _ = app.emit_to("main", "scan_result", &payload);
+
+        if let Ok(mut cache) = state.scanned_paths.lock() { cache.insert(path); }
+
+        Ok(())
     }
 
     #[tauri::command]
@@ -661,42 +669,39 @@ mod commands {
     }
 
     #[tauri::command]
-    pub async fn get_current_pdf(state: State<'_, AppState>) -> Result<Option<String>, String> {
-        Ok(state.last_pdf_path.lock().map_err(|e| e.to_string())?.clone())
-    }
-
-    #[tauri::command]
-    pub async fn get_model_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-        let ready    = *state.model_ready.lock().map_err(|e| e.to_string())?;
-        let model_id = state.model_id.lock().map_err(|e| e.to_string())?.clone();
-        let device   = state.device.lock().map_err(|e| e.to_string())?.clone();
-        Ok(serde_json::json!({
-            "model":       model_id.unwrap_or_else(|| "google/gemma-3-1b-it".to_string()),
-            "device":      device.unwrap_or_else(|| "unknown".to_string()),
-            "script_path": state.script_path,
-            "ready":       ready,
-        }))
-    }
-
-    /// Produce a redacted copy of the current document and open it in Preview.
-    /// The original file is NEVER modified.
-    #[tauri::command]
-    pub async fn redact_document(state: State<'_, AppState>) -> Result<String, String> {
-        // Get current path and detections
-        let source_path = state.last_pdf_path.lock()
-            .map_err(|e| e.to_string())?
-            .clone()
-            .ok_or("No document currently open")?;
-
-        let detections = state.last_detections.lock()
-            .map_err(|e| e.to_string())?
-            .clone();
-
-        if detections.is_empty() {
-            return Err("No detections to redact — scan a document first".into());
+    pub async fn open_in_preview(path: String) -> Result<(), String> {
+        let ext = std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if ext == "pdf" {
+            std::process::Command::new("osascript")
+                .arg("-e").arg(format!(r#"tell application "Preview" to open POSIX file "{path}""#))
+                .spawn().map_err(|e| e.to_string())?;
+        } else {
+            std::process::Command::new("open")
+                .arg(&path)
+                .spawn().map_err(|e| e.to_string())?;
         }
+        Ok(())
+    }
 
-        // Spawn or reuse the redactor subprocess
+    #[tauri::command]
+    pub async fn save_redacted_document(temp_path: String, dest_path: String) -> Result<(), String> {
+        std::fs::copy(&temp_path, &dest_path).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[tauri::command]
+    pub async fn redact_document(
+        state: State<'_, AppState>,
+        source_path: String,
+        detections: Vec<serde_json::Value>,
+    ) -> Result<String, String> {
+        if detections.is_empty() { return Err("No detections to redact".into()); }
+        if source_path.is_empty() { return Err("No source path provided".into()); }
+
         let mut guard = state.redact_process.lock().map_err(|e| e.to_string())?;
         if guard.is_none() {
             let proc = spawn_redactor().map_err(|e| e.to_string())?;
@@ -704,41 +709,25 @@ mod commands {
         }
 
         let proc = guard.as_mut().unwrap();
-
-        // Send request
-        let req = serde_json::json!({
-            "id":          "redact-1",
-            "source_path": source_path,
-            "detections":  detections,
-        });
+        let req_id = format!("redact-{}", timestamp_ms());
+        let req = serde_json::json!({ "id": req_id, "source_path": source_path, "detections": detections });
         let mut req_str = serde_json::to_string(&req).map_err(|e| e.to_string())?;
         req_str.push('\n');
         proc.stdin.write_all(req_str.as_bytes()).map_err(|e| e.to_string())?;
         proc.stdin.flush().map_err(|e| e.to_string())?;
 
-        // Read response
         let mut resp_line = String::new();
         loop {
             resp_line.clear();
             let n = proc.stdout.read_line(&mut resp_line).map_err(|e| e.to_string())?;
-            if n == 0 { return Err("Redactor subprocess closed unexpectedly".into()); }
+            if n == 0 { return Err("Redactor subprocess closed".into()); }
             let t = resp_line.trim();
             if t.is_empty() { continue; }
             let resp: serde_json::Value = serde_json::from_str(t).map_err(|e| e.to_string())?;
             if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
                 if !err.is_empty() { return Err(err.to_string()); }
             }
-            let redacted_path = resp.get("redacted_path")
-                .and_then(|p| p.as_str())
-                .ok_or("No redacted_path in response")?
-                .to_string();
-
-            // Open in Preview via osascript
-            let _ = std::process::Command::new("osascript")
-                .arg("-e")
-                .arg(format!(r#"tell application "Preview" to open POSIX file "{redacted_path}""#))
-                .spawn();
-
+            let redacted_path = resp.get("redacted_path").and_then(|p| p.as_str()).ok_or("No redacted_path in response")?.to_string();
             return Ok(redacted_path);
         }
     }
@@ -751,16 +740,18 @@ mod commands {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())       
+        .plugin(tauri_plugin_notification::init()) 
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            commands::login,                   // <--- Added login command
             commands::start_scanning,
             commands::stop_scanning,
-            commands::set_overlay_visible,
-            commands::get_overlay_active,
             commands::scan_clipboard_now,
-            commands::get_current_pdf,
-            commands::get_model_info,
+            commands::scan_manual_file,
             commands::redact_document,
+            commands::open_in_preview,         
+            commands::save_redacted_document,  
         ])
         .run(tauri::generate_context!())
         .expect("error while running Axiom");
