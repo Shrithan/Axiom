@@ -3,14 +3,10 @@
 Axiom — Universal PII scanner subprocess (Gemma-3-4B + Regex edition)
 =======================================================================
 Supports: PDF, DOCX, XLSX, PPTX
-
-Upgrades in this version:
-- Robust capture groups (extracts just the password, not the label)
-- String normalization (prevents double-stacked redaction boxes)
-- Extended regex patterns (catches AWS secrets, CVVs, expiration dates)
 """
 
 import sys, json, re, logging, os, time
+
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="[PDFScanner] %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -27,6 +23,7 @@ MAX_NEW_TOKENS = 1024
 LABEL_SEVERITY = {
     "SSN":             "CRITICAL",
     "CREDIT_CARD":     "CRITICAL",
+    "CC_METADATA":     "CRITICAL",
     "AWS_KEY":         "CRITICAL",
     "AWS_SECRET":      "CRITICAL",
     "JWT":             "CRITICAL",
@@ -45,6 +42,14 @@ LABEL_SEVERITY = {
 }
 DEFAULT_SEVERITY = "MEDIUM"
 VALID_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
+
+# ---------------------------------------------------------------------------
+# Model state
+# ---------------------------------------------------------------------------
+
+_model     = None
+_tokenizer = None
+_device    = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -71,7 +76,7 @@ def chunk_text(text: str) -> list:
     return chunks or [text]
 
 # ---------------------------------------------------------------------------
-# Stage 1 — Regex (deterministic, zero hallucination)
+# Stage 1 — Regex
 # ---------------------------------------------------------------------------
 
 _DOB_CONTEXT_RE = re.compile(
@@ -84,26 +89,16 @@ _REGEX_PATTERNS = [
     ("EMAIL",       "MEDIUM",   re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
     ("IP_ADDRESS",  "LOW",      re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
     ("PHONE",       "MEDIUM",   re.compile(r"\b(?:\+1[\s\-]?)?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4}\b")),
-    
-    # Strictly the CC number
     ("CREDIT_CARD", "CRITICAL", re.compile(r"\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13}|6(?:011|5\d{2})\d{12})\b")),
-    # New rule just for the CVV / Expiration metadata
     ("CC_METADATA", "CRITICAL", re.compile(r"(?i)\b(?:cvv|cvc|exp|expiration)\b\s*[:=]?\s*[\d/]+")),
-    
     ("AWS_KEY",     "CRITICAL", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    # Allows whitespace/newlines inside the base64 key
     ("AWS_SECRET",  "CRITICAL", re.compile(r"(?i)(?:secret|aws_secret_access_key).{0,20}[:=]\s*([A-Za-z0-9/+= \n\r]{35,45})")),
-    
-    # Removed "secret" from the trigger words so it doesn't conflict with AWS
     ("PASSWORD",    "CRITICAL", re.compile(r"(?i)(?:password|passwd|pwd).{0,20}[:=]\s*([^\s]{5,})")),
-    
     ("JWT",         "CRITICAL", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b")),
+    ("PRIVATE_KEY", "CRITICAL", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
 ]
 
-_DATE_RE = re.compile(
-    r"\b(?:\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})\b"
-)
-
+_DATE_RE = re.compile(r"\b(?:\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})\b")
 
 def regex_scan(text: str, page_num: int) -> list:
     results = []
@@ -112,16 +107,12 @@ def regex_scan(text: str, page_num: int) -> list:
     for label, severity, pat in _REGEX_PATTERNS:
         for m in pat.finditer(text):
             val = m.group(1) if m.lastindex else m.group(0)
-            
-            # Clean up hidden PDF line breaks inside the captured secret
             val = re.sub(r'\s+', ' ', val).strip()
-            
-            if not val: continue
+            if not val:
+                continue
 
-            # Normalization Fix: Prevent overlaps
             norm_val = normalize_string(val)
             key = (label, norm_val)
-            
             if key in seen:
                 continue
             seen.add(key)
@@ -165,45 +156,32 @@ def regex_scan(text: str, page_num: int) -> list:
     return results
 
 # ---------------------------------------------------------------------------
-# Stage 2 — Gemma 4B  (semantic / contextual PII)
+# Stage 2 — Gemma 4B
 # ---------------------------------------------------------------------------
 
 def load_model() -> None:
     global _model, _tokenizer, _device
-
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    _device = (
-        "mps"  if torch.backends.mps.is_available() else
-        "cuda" if torch.cuda.is_available()         else
-        "cpu"
-    )
+    _device = ("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Loading {GEMMA_MODEL_ID} on {_device}...")
     _tokenizer = AutoTokenizer.from_pretrained(GEMMA_MODEL_ID)
-    _model = AutoModelForCausalLM.from_pretrained(
-        GEMMA_MODEL_ID,
-        dtype=torch.bfloat16,
-    ).to(_device)
+    _model = AutoModelForCausalLM.from_pretrained(GEMMA_MODEL_ID, dtype=torch.bfloat16).to(_device)
     _model.eval()
     log.info(f"Gemma ready (device={_device})")
 
 GEMMA_SYSTEM = (
-    "You are a data-loss-prevention engine. "
-    "Extract ONLY personally identifiable information (PII) and sensitive credentials "
-    "from the TEXT. Return a JSON array — nothing else.\n\n"
+    "You are a data-loss-prevention engine. Extract ONLY personally identifiable information (PII) "
+    "and sensitive credentials from the TEXT. Return a JSON array — nothing else.\n\n"
     "Rules:\n"
-    "- A bare date like 01/01/1990 is only DOB if the text explicitly says "
-    "'date of birth', 'DOB', 'born', or 'birthday' nearby.\n"
+    "- A bare date like 01/01/1990 is only DOB if the text explicitly says 'date of birth', 'DOB', 'born', or 'birthday' nearby.\n"
     "- Do NOT invent values. Only extract text that literally appears in the TEXT.\n"
     "- Do NOT repeat the same value twice.\n"
     "- If nothing sensitive is present return [].\n\n"
-    "Labels (use exactly): NAME, ADDRESS, DOB, PASSPORT, DRIVERS_LICENSE, "
-    "BANK_ACCOUNT, EMAIL, PHONE, SSN, CREDIT_CARD, IP_ADDRESS, "
-    "AWS_KEY, JWT, PRIVATE_KEY, PASSWORD, API_KEY\n\n"
+    "Labels (use exactly): NAME, ADDRESS, DOB, PASSPORT, DRIVERS_LICENSE, BANK_ACCOUNT, EMAIL, PHONE, SSN, CREDIT_CARD, IP_ADDRESS, AWS_KEY, JWT, PRIVATE_KEY, PASSWORD, API_KEY\n\n"
     "Each object: "
-    '{"label":"...","value":"exact text","severity":"CRITICAL|HIGH|MEDIUM|LOW",'
-    '"confidence":"high|medium|low"}'
+    '{"label":"...","value":"exact text","severity":"CRITICAL|HIGH|MEDIUM|LOW","confidence":"high|medium|low"}'
 )
 
 def _parse_json_array(text: str) -> list:
@@ -211,37 +189,31 @@ def _parse_json_array(text: str) -> list:
     try:
         r = json.loads(clean)
         if isinstance(r, list): return r
-    except json.JSONDecodeError:
-        pass
+    except json.JSONDecodeError: pass
     m = re.search(r"\[[\s\S]*\]", clean)
     if m:
         try:
             r = json.loads(m.group(0))
             if isinstance(r, list): return r
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError: pass
     return []
 
 def run_gemma(text_chunk: str) -> tuple:
     import torch
-
     messages = [{"role": "user", "content": f"{GEMMA_SYSTEM}\n\nTEXT:\n{text_chunk}"}]
     prompt = _tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = _tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(_device)
 
     with torch.inference_mode():
-        output_ids = _model.generate(
-            **inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False, pad_token_id=_tokenizer.eos_token_id,
-        )
+        output_ids = _model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False, pad_token_id=_tokenizer.eos_token_id)
 
     input_len = inputs["input_ids"].shape[1]
     raw = _tokenizer.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
     return _parse_json_array(raw), raw
 
-
 def gemma_scan(text: str, page_num: int, regex_values_normalized: set) -> tuple:
     chunks       = chunk_text(text)
-    seen         = set(regex_values_normalized)  # Seed with normalized regex matches
+    seen         = set(regex_values_normalized)
     dets         = []
     raw_count    = 0
     parse_errors = 0
@@ -253,7 +225,6 @@ def gemma_scan(text: str, page_num: int, regex_values_normalized: set) -> tuple:
         try:
             findings, raw_out = run_gemma(chunk)
         except Exception as e:
-            log.warning(f"  p{page_num} chunk {idx}: inference failed: {e}")
             parse_errors += 1
             continue
 
@@ -328,14 +299,22 @@ def extract_docx(path: str) -> list:
 
 def extract_xlsx(path: str) -> list:
     import openpyxl
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    # Do NOT use read_only=True — it causes data_only=True to return None for
+    # formula-result cells in many real-world xlsx files, starving Gemma of text.
+    # data_only=True still gives us the cached formula results when available.
+    wb = openpyxl.load_workbook(path, data_only=True)
     pages = []
     for sheet_num, ws in enumerate(wb.worksheets, start=1):
         rows = []
+        # Include the sheet title as context so Gemma understands the domain
+        rows.append(f"[Sheet: {ws.title}]")
         for row in ws.iter_rows(values_only=True):
-            row_text = "\t".join(str(c) if c is not None else "" for c in row)
-            if row_text.strip(): rows.append(row_text)
-        pages.append((sheet_num, "\n".join(rows)))
+            cells = [str(c).strip() if c is not None else "" for c in row]
+            row_text = "\t".join(cells)
+            if row_text.strip():
+                rows.append(row_text)
+        if len(rows) > 1:  # more than just the sheet title
+            pages.append((sheet_num, "\n".join(rows)))
     wb.close()
     return pages
 
@@ -383,7 +362,6 @@ def scan_document(path: str) -> tuple:
             continue
 
         regex_dets = regex_scan(text, page_num)
-        # Normalize regex hits so Gemma doesn't double-tag them
         regex_values_normalized = {normalize_string(d["value"]) for d in regex_dets}
 
         gemma_dets, page_log = gemma_scan(text, page_num, regex_values_normalized)
@@ -418,7 +396,6 @@ def check_deps(ext: str) -> str | None:
         if ext in (".pptx", ".ppt"): return "python-pptx not installed"
     return None
 
-
 def main():
     try: import pdfminer  # noqa
     except ImportError:
@@ -449,9 +426,7 @@ def main():
         if not line: continue
         try: req = json.loads(line)
         except json.JSONDecodeError as e:
-            sys.stdout.write(json.dumps({
-                "id": "?", "detections": [], "gemma_log": [], "error": f"JSON: {e}",
-            }) + "\n")
+            sys.stdout.write(json.dumps({"id": "?", "detections": [], "gemma_log": [], "error": f"JSON: {e}"}) + "\n")
             sys.stdout.flush()
             continue
 
@@ -461,9 +436,7 @@ def main():
         ext = os.path.splitext(pdf_path)[1].lower()
         dep_err = check_deps(ext)
         if dep_err:
-            sys.stdout.write(json.dumps({
-                "id": req_id, "detections": [], "gemma_log": [], "error": dep_err,
-            }) + "\n")
+            sys.stdout.write(json.dumps({"id": req_id, "detections": [], "gemma_log": [], "error": dep_err}) + "\n")
             sys.stdout.flush()
             continue
 
@@ -475,7 +448,6 @@ def main():
 
         sys.stdout.write(json.dumps(resp) + "\n")
         sys.stdout.flush()
-
 
 if __name__ == "__main__":
     main()
