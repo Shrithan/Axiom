@@ -1,0 +1,19 @@
+{
+  "verified_on": "2026-10-02",
+  "environment": "Real Google Chrome on macOS, unpacked extension, release Tauri app, Native Messaging and loopback receiving server",
+  "extension_id": "hdllggekmmgdgkkhblemoecomiemhphk",
+  "fixture_sha256": "0dd3f89addf85939ba2576524d9c56cc24fb9cfe68e57b93a97c9838e2fdbea5",
+  "stages": [
+    {"case": "Project Penguin EXTERNAL BLOCK", "external_requests": 0, "external_file_bytes": 0},
+    {"case": "same file INTERNAL ALLOW", "internal_requests": 1, "internal_file_bytes": 65, "received_sha256": "0dd3f89addf85939ba2576524d9c56cc24fb9cfe68e57b93a97c9838e2fdbea5"},
+    {"case": "ordinary EXTERNAL ALLOW", "external_requests": 1, "external_file_bytes": 35, "received_sha256": "4e15de192bc37c8e68f80a8d0ba5a4528ada9fe3a35d2b40087808d6e83eb285"},
+    {"case": "agent unavailable, Project Penguin withheld", "external_requests": 1, "external_file_bytes": 35},
+    {"case": "TXT REDACT with explicit consent", "external_requests": 2, "external_file_bytes": 130, "received_derivative_bytes": 95, "received_derivative_sha256": "5e26a1c15909ee5093c5a3b2d98e1c6970ac4df4c43cdcbd949846862ba3b3cc"},
+    {"case": "WARN with explicit consent", "external_requests": 3, "external_file_bytes": 155, "received_bytes": 25, "received_sha256": "af2a657636d95b5df06eb5ddc04ffb6547fb1ce515ba38262002dba9c64adb8e"},
+    {"case": "mixed ordinary and Project Penguin files EXTERNAL BLOCK", "external_requests": 3, "external_file_bytes": 155}
+  ],
+  "activity_verified": ["UPLOAD_BLOCKED", "UPLOAD_ALLOWED", "UPLOAD_REDACTED", "UPLOAD_WARNED", "CLIPBOARD_CLEARED", "REVIEW_REQUIRED"],
+  "protected_original_unchanged": true,
+  "fixture_values_in_activity_database": false,
+  "benchmark": {"fixture_bytes": 10500, "round_trip_ms": [99.7, 74.8, 72.7, 68.9, 75.0], "pipeline_ms": [5, 4, 4, 4, 4], "scope": "Private socket + Python worker assessment, excluding Chrome, file reading and submission; no upload commit"}
+}

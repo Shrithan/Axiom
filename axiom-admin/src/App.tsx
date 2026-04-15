@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { invoke } from "@tauri-apps/api/core";
 import './App.css'; // Connects to the unified Gold theme
 
@@ -769,6 +769,7 @@ export default function AdminApp() {
   const [rules, setRules] = useState<PolicyRule[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [loading, setLoading] = useState(true);
+  const [backendError, setBackendError] = useState(false);
 
   const addToast = useCallback((msg: string, type: Toast['type'] = 'ok') => {
     const id = ++_toastId;
@@ -811,7 +812,9 @@ export default function AdminApp() {
       
       setLoading(false);
     } catch (err) {
-      console.error("Axiom Sync Error:", err);
+      setBackendError(true);
+      setLoading(false);
+      void err;
       // Only show toast if it's the first failure to avoid spamming the user
       if (loading) addToast("Failed to sync with backend", "danger");
     }
@@ -822,12 +825,7 @@ export default function AdminApp() {
     // Initial fetch
     loadData(); 
     
-    // Auto-refresh every 3 seconds
-    const intervalId = setInterval(() => {
-      loadData();
-    }, 3000); 
-
-    return () => clearInterval(intervalId);
+    // Cloud synchronization is retired. No background polling in local-only V1.
   }, [loadData]);
 
   const handleEmployeeUpdate = useCallback(async (id: string, patch: any) => {
@@ -860,6 +858,10 @@ export default function AdminApp() {
       addToast("Failed to update severity", "danger");
     }
   }, [addToast, loadData]);
+
+  if (backendError) {
+    return <main style={{padding:40,color:"var(--text)",background:"var(--bg)",height:"100vh"}}><h1>Axiom Admin prototype</h1><p>Enterprise management and cloud synchronization are deferred.</p><p>Configure working V1 organization policies in the employee app’s Local Rules page. The old admin rules do not enforce employee scans.</p></main>;
+  }
 
   if (loading) {
     return (

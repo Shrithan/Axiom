@@ -1,41 +1,34 @@
 [package]
 name = "axiom"
 version = "0.4.0"
-description = "Axiom — Local-first data-leakage prevention (Preview PDF edition)"
-authors     = ["Your Name <you@example.com>"]
-edition     = "2021"
+description = "Axiom Local Privacy Agent"
+authors = ["Shrithan Adipuram"]
+edition = "2021"
 
 [profile.release]
-opt-level     = 3
-lto           = true
+opt-level = 3
+lto = true
 codegen-units = 1
-strip         = true
+strip = true
 
 [dependencies]
-tauri              = { version = "2", features = [ "macos-private-api", "devtools"] }
-tauri-plugin-shell = "2"
-
-# Clipboard regex fallback
-regex       = "1"
-lazy_static = "1"
-arboard     = "3"
-
-serde      = { version = "1", features = ["derive"] }
+tauri = { version = "=2.10.2", features = ["macos-private-api", "tray-icon"] }
 serde_json = "1"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "=2.3.3"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+base64 = "0.22"
+libc = "0.2"
 
-tokio   = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-zeroize = { version = "1", features = ["derive"] }
-
-log        = "0.4"
-env_logger = "0.11"
-thiserror  = "1"
-anyhow     = "1"
-dirs       = "5"
-tauri-plugin-notification = "2.0.0-rc"
-tauri-plugin-dialog = "2.0.0-rc"
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSWorkspace", "NSRunningApplication"] }
+objc2-foundation = "0.3"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "=2.5.5", features = [] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

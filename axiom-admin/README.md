@@ -1,7 +1,13 @@
-# Tauri + React + Typescript
+# Axiom admin prototype
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+The original React/Vite/Tauri management UI is retained for future control-plane work.
+Firebase synchronization and credentials have been removed. The UI explicitly reports
+that enterprise management is deferred; legacy admin rule fixtures do not enforce
+employee scans.
 
-## Recommended IDE Setup
+For functional V1 organization configuration, use **Local Rules** in the employee app.
+See [the repository README](../README.md) for the actual pipeline and limitations.
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+Build this retained prototype with `npm install` and `npm run build`; check its native
+backend with `cargo check --manifest-path src-tauri/Cargo.toml`. This is not a functioning
+enterprise management service or a source of enforced employee policies.
