@@ -66,6 +66,7 @@ interface FileLog {
   totalCount: number;
   highestSeverity: Severity;
   redactedPath: string | null;
+  firebaseLogId: string | null;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1211,6 +1212,26 @@ export default function App() {
   const processedIds = useRef<Set<string>>(new Set());
   const totalFlags = fileLogs.reduce((n, l) => n + l.totalCount, 0);
 
+  // Load persisted logs on startup
+  useEffect(() => {
+    if (!authUser) return;
+    invoke<FileLog[]>("load_file_logs")
+      .then(saved => {
+        if (saved && saved.length > 0) {
+          setFileLogs(saved);
+          saved.flatMap(l => Object.values(l.byType).flat())
+               .forEach(d => processedIds.current.add(d.id));
+        }
+      })
+      .catch(() => {});
+  }, [authUser]);
+
+  // Persist logs whenever they change
+  useEffect(() => {
+    if (!authUser || fileLogs.length === 0) return;
+    invoke("save_file_logs", { logs: fileLogs }).catch(() => {});
+  }, [fileLogs, authUser]);
+
   const handleScanResult = useCallback((payload: ScanResultPayload) => {
     const fresh = payload.detections.filter(d => !processedIds.current.has(d.id));
     if (!fresh.length) return;
@@ -1232,7 +1253,7 @@ export default function App() {
     setFileLogs(prev => {
       const idx = prev.findIndex(l => l.fullPath === fullPath);
       if (idx === -1) {
-        return [{ fileName, fullPath, scannedAt: now, byType, totalCount: fresh.length, highestSeverity: maxSeverity(fresh), redactedPath: null }, ...prev];
+        return [{ fileName, fullPath, scannedAt: now, byType, totalCount: fresh.length, highestSeverity: maxSeverity(fresh), redactedPath: null, firebaseLogId: `log_${now}` }, ...prev];
       }
       const existing = prev[idx];
       const merged: Record<string, Detection[]> = { ...existing.byType };
@@ -1279,6 +1300,10 @@ export default function App() {
       const detections = log ? Object.values(log.byType).flat() : [];
       const path = await invoke<string>('redact_document', { sourcePath: fullPath, detections });
       setFileLogs(prev => prev.map(l => l.fullPath === fullPath ? { ...l, redactedPath: path } : l));
+      // Mark as redacted in Firestore so admin side shows Yes
+      if (log?.firebaseLogId) {
+        invoke('mark_activity_redacted', { logId: log.firebaseLogId }).catch(() => {});
+      }
       setStatusTxt('Redaction complete');
     } catch (err) {
       console.error('[Axiom] redact_document error:', err);

@@ -51,7 +51,7 @@ def redact_pdf(source_path: str, detections: list) -> str:
     for d in detections:
         raw_val = str(d.get("raw_value", "")).strip()
         if raw_val:
-            p_idx = max(0, int(d.get("page", 1)) - 1)
+            p_idx = max(0, int(d.get("page") or 1) - 1)
             by_page.setdefault(p_idx, []).append(d)
 
     for page_idx, page_dets in by_page.items():

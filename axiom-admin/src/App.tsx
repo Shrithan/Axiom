@@ -762,8 +762,10 @@ type Toast = { id: number; msg: string; type: 'ok'|'danger'|'warn' };
 
 export default function AdminApp() {
   const [page, setPage] = useState<AdminPage>('dashboard');
-  const [employees, setEmployees] = useState<Employee[]>([]);
-  const [activity, setActivity] = useState<ActivityLog[]>([]);
+  
+  // State definitions
+  const [employees, setEmployees] = useState<any[]>([]);
+  const [activity, setActivity] = useState<any[]>([]);
   const [rules, setRules] = useState<PolicyRule[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [loading, setLoading] = useState(true);
@@ -774,6 +776,8 @@ export default function AdminApp() {
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3500);
   }, []);
 
+  // CONSOLIDATED DATA LOADER
+  // This maps the Rust snake_case to your React camelCase
   const loadData = useCallback(async () => {
     try {
       const [empRes, actRes, ruleRes] = await Promise.all([
@@ -807,62 +811,55 @@ export default function AdminApp() {
       
       setLoading(false);
     } catch (err) {
-      console.error(err);
-      addToast("Failed to sync with backend", "danger");
+      console.error("Axiom Sync Error:", err);
+      // Only show toast if it's the first failure to avoid spamming the user
+      if (loading) addToast("Failed to sync with backend", "danger");
     }
-  }, [addToast]);
+  }, [addToast, loading]);
 
-  // Initial Hydration
+  // SINGLE HEARTBEAT EFFECT
   useEffect(() => {
-    // 1. Fetch immediately on load
+    // Initial fetch
     loadData(); 
     
-    // 2. Fetch every 3 seconds to check for new Employee scans
+    // Auto-refresh every 3 seconds
     const intervalId = setInterval(() => {
       loadData();
     }, 3000); 
 
-    // 3. Cleanup the interval when the app closes
     return () => clearInterval(intervalId);
   }, [loadData]);
 
   const handleEmployeeUpdate = useCallback(async (id: string, patch: any) => {
     try {
-      // In production, connect this to an actual SQL UPDATE command.
       const updated = await invoke<any>('update_employee', { id, patch });
-      setEmployees(prev => prev.map(e => e.id === id ? {
-        ...updated,
-        lastSeen: updated.last_seen,
-        totalScans: updated.total_scans,
-        totalDetections: updated.total_detections,
-        riskScore: updated.risk_score,
-        avatarInitials: updated.avatar_initials
-      } : e));
+      // Refresh all data after an update to stay in sync
+      loadData();
       addToast(`Employee status: ${updated.status}`, 'ok');
     } catch (err) {
       addToast("Failed to update employee", "danger");
     }
-  }, [addToast]);
+  }, [addToast, loadData]);
 
   const handleRuleToggle = useCallback(async (id: string) => {
     try {
-      const updated = await invoke<any>('toggle_rule', { id });
-      setRules(prev => prev.map(r => r.id === id ? { ...updated, detectionCount: updated.detection_count } : r));
-      addToast(`Policy ${updated.enabled ? 'Enabled' : 'Disabled'}`, 'ok');
+      await invoke<any>('toggle_rule', { id });
+      loadData();
+      addToast(`Policy Updated`, 'ok');
     } catch (err) {
       addToast("Failed to toggle rule", "danger");
     }
-  }, [addToast]);
+  }, [addToast, loadData]);
 
   const handleSeverityChange = useCallback(async (id: string, severity: Severity) => {
     try {
-      const updated = await invoke<any>('set_rule_severity', { id, severity });
-      setRules(prev => prev.map(r => r.id === id ? { ...updated, detectionCount: updated.detection_count } : r));
+      await invoke<any>('set_rule_severity', { id, severity });
+      loadData();
       addToast(`Severity updated to ${severity}`, 'ok');
     } catch (err) {
       addToast("Failed to update severity", "danger");
     }
-  }, [addToast]);
+  }, [addToast, loadData]);
 
   if (loading) {
     return (
@@ -872,7 +869,7 @@ export default function AdminApp() {
     );
   }
 
-  const activeEmployees = employees.filter(e=>e.status==='active').length;
+  const activeEmployees = employees.filter(e => e.status === 'active').length;
 
   return (
     <div style={{
