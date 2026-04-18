@@ -23,3 +23,27 @@ dist-ssr
 *.sln
 *.sw?
 public/models/
+
+# Local agent runtime
+__pycache__/
+*.pyc
+.venv/
+**/src-tauri/target/
+.axiom-local/
+**/src-tauri/gen/
+
+# Machine-specific Native Messaging launcher
+browser-extension/native/axiom-native-host
+
+# Release archives and machine secrets
+releases/
+.pnpm-store/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+# Unused legacy OCR assets; no active runtime references
+axiom-employee/legacy-model-assets/
+axiom-employee/src-tauri/models/

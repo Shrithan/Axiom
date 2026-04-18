@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Axiom Browser Boundary",
+  "version": "0.1.1",
+  "description": "Local destination-aware multipart upload gate and a block-all Gmail file-drop guard.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsCYCqWZ3gO+VuLy1+GqJaDG7WYTXgYxbOcRjA/k5QOpHJuNfHWfRMUtBRR0trASYafb+KbZOTnQ9tG4wLREqyB1szekMULdwJk9n/WJxNRHibA2aKqnd5Fz5dhzBWuCl0L2l5ak8QsuroDW73D4uk2E3OeiBBFamnGHv6ke5lS9U4bvv/L3uE9uVtRTyzTWlnu7BWwXSFH/fw0thOE2TY8+Jq6/qPRan4O8f9i/5Q6W7BuktImzF899wB2jzsTBohoJxCGL4/xot+vcuQ9ZO3PZ/gkOi7Cd8uXbFFEm70HYLInrhP44+w/p3wGsBpfIrOnMXxShBeDY7yv/aCTt4MQIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "scripting",
+    "activeTab"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "Axiom browser protection"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'none'"
+  }
+}
