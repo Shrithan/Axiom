@@ -5,12 +5,6 @@
     "main"
   ],
   "permissions": [
-    "core:default",
-    "core:event:default",
-    "shell:default",
-    "notification:default",
-    "notification:default",
-    "dialog:default",
-    "dialog:default"
+    "core:default"
   ]
 }

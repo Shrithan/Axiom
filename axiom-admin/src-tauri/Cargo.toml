@@ -12,22 +12,8 @@ codegen-units = 1
 strip         = true
 
 [dependencies]
-tauri              = { version = "2", features = [ "devtools"] }
-tauri-plugin-opener = "2"
-tauri-plugin-shell  = "2"
-tauri-plugin-dialog = "2.0.0-rc"
-
-serde      = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
 serde_json = "1"
-
-tokio   = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-
-log        = "0.4"
-env_logger = "0.11"
-thiserror  = "1"
-anyhow     = "1"
-
-
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

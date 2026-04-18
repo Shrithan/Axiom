@@ -13,12 +13,12 @@
     "windows": [
       {
         "label": "main",
-        "title": "Axiom — Data Leakage Prevention",
-        "width": 1100, 
-        "height": 750,
-        "minWidth": 1100,
-        "minHeight": 750,
-        "resizable": true, 
+        "title": "Axiom \u2014 Local Privacy Agent",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 760,
+        "minHeight": 560,
+        "resizable": true,
         "fullscreen": false,
         "maximized": false,
         "decorations": true,
@@ -41,6 +41,8 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": []
+    "resources": {
+      "../scripts/": "scripts/"
+    }
   }
 }
