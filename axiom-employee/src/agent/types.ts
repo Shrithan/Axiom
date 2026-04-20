@@ -1,0 +1,4 @@
+export type Rule = {id:string; name:string; kind:'keyword'|'regex'|'builtin'; pattern:string; case_sensitive:boolean; severity:string; action:string; transformation:string; replacement:string; enabled:boolean; destinations:string[]; events:string[]};
+export type Section = {text:string; location:Record<string, string|number|boolean>};
+export type Result = {document:{name:string;type:string;sections:Section[];metadata:{coverage:string}}; detections:{id:string;type:string;matched_text:string;detector:string;start:number;end:number;location:Section['location'];confidence:number}[]; decisions:{detection_id:string;action:string;rule_id:string|null;rule_name:string;severity:string;transformation:string|null;reason:string}[]; action:string;status:string;protected_sections:Section[]|null};
+export type Context = {action:string;destination:string};
