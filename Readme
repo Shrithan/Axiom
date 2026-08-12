@@ -1,0 +1,41 @@
+Axiom
+
+Axiom is a privacy-guard dashboard concept for detecting and redacting sensitive information from recordings and documents. It demonstrates a local-first workflow for reviewing personally identifiable information (PII), credentials, secrets, and personal data before content is shared or stored.
+
+
+
+Overview
+
+Axiom presents two connected workflows:
+
+Detection: Start and stop a simulated recording session, scan it, and review categorized sensitive-data findings.
+
+Redaction: Open a simulated document viewer, inspect highlighted findings, redact individual items or all findings, restore them, and simulate exporting a clean copy.
+
+The interface is packaged as a single axiom.html file with embedded styles and JavaScript, so it can be opened directly in a browser without a build step.
+
+Features
+
+Dark, privacy-focused dashboard UI
+
+Simulated recording timer and scanning progress
+
+Detection summary grouped into:
+
+PII, such as Social Security and credit card numbers
+
+Secrets, such as access keys and connection strings
+
+Personal data, such as email addresses and home addresses
+
+Interactive document redaction preview
+
+Individual and bulk redaction controls
+
+Restore-all workflow
+
+In-app alerts and scan status indicators
+
+Keyboard shortcut to start or stop recording: Ctrl+R or Cmd+R
+
+Responsive single-file implementation with no framework or package installation
